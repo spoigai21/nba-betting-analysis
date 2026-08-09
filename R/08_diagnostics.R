@@ -346,9 +346,13 @@ encompassing_report <- function(d) {
 
   # --- stability across seasons -------------------------------------------
   # A coefficient that changes sign season to season is noise wearing a
-  # p-value. One that holds its sign is worth acting on.
+  # p-value. One that holds its sign is worth acting on. This is not
+  # decoration: a pooled interval can clear zero on a coefficient that is
+  # positive half the time and negative the other half, and reporting that as
+  # a finding is exactly the failure this file exists to prevent.
   message("")
-  for (tg in names(targets)) {
+  stable <- setNames(rep(FALSE, nrow(out)), out$target)
+  for (tg in out$target) {
     sp <- targets[[tg]]
     dd <- tibble(actual = d[[sp$actual]], model = d[[sp$model]],
                  market = d[[sp$market]], season = d$season) %>%
@@ -358,16 +362,39 @@ encompassing_report <- function(d) {
       f <- fit_one(g)
       tibble(season = g$season[1], beta_model = f$beta_model)
     })
-    if (nrow(per) > 1)
+    if (nrow(per) > 1) {
+      stable[[tg]] <- length(unique(sign(per$beta_model))) == 1
       info(tg, " model coefficient by season: ",
            paste(sprintf("%d %+.2f", per$season, per$beta_model), collapse = "  "),
-           if (length(unique(sign(per$beta_model))) == 1)
-             "  (sign stable)" else "  (SIGN FLIPS -- treat as noise)")
+           if (stable[[tg]]) "  (sign stable)" else "  (SIGN FLIPS -- treat as noise)")
+    }
   }
 
   # --- verdict -------------------------------------------------------------
+  # Two conditions, both required: the pooled interval must clear zero AND the
+  # per-season sign must hold. Either alone is a way to fool yourself.
   message("")
-  informative <- out %>% filter(.data$model_lo > 0 | .data$model_hi < 0)
+  out$sign_stable <- unname(stable[out$target])
+  informative <- out %>%
+    filter((.data$model_lo > 0 | .data$model_hi < 0), .data$sign_stable)
+
+  unstable <- out %>%
+    filter((.data$model_lo > 0 | .data$model_hi < 0), !.data$sign_stable)
+  if (nrow(unstable)) {
+    for (i in seq_len(nrow(unstable))) {
+      r <- unstable[i, ]
+      message(sprintf(
+        "   %s: the pooled coefficient (%+.3f) clears zero, but its sign flips",
+        r$target, r$beta_model))
+      message("   across seasons. That is not a signal -- it is a pooled average of")
+      message("   inconsistent seasons, and it will not reproduce out of sample.")
+      if (r$beta_model < 0)
+        message("   It is also NEGATIVE, which would mean fading our own forecast: ",
+                "\n   far likelier to be model mis-specification than an edge.")
+    }
+    message("")
+  }
+
   if (!nrow(informative)) {
     message("   The closing line encompasses the model on every target: once you")
     message("   know the line, our number adds nothing measurable. That is the")

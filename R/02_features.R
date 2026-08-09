@@ -107,6 +107,88 @@ TEAM_FEATURE_COLS <- c("gp_prior", "win_pct_prior", "pf_prior", "pa_prior",
                        "rest_days", "b2b", "games_last_7", "prev_season_net")
 
 # ===========================================================================
+# 2b. Opponent-adjusted team ratings
+# ===========================================================================
+# net_prior is raw point differential, which credits a team for the schedule it
+# happened to draw. A team that has played the league's worst opponents looks
+# better than it is, and the market corrects for that as a matter of course.
+#
+# For every game date in a season, ratings are fitted on the games played
+# STRICTLY BEFORE that date:
+#
+#     margin_ij = rating_i - rating_j + home_advantage
+#
+# solved as ridge regression. The penalty does the early-season work: two games
+# in, a team's rating stays near league average instead of exploding. The
+# home-advantage term is estimated alongside and left unpenalised.
+#
+# The identical design fitted on total points instead of margin gives a pace
+# rating per team:  total_ij = pace_i + pace_j + base.
+#
+# Cost is kept down by accumulating X'X and X'y one game at a time as the
+# season advances, rather than rebuilding the design matrix at every date.
+
+solve_ridge <- function(XtX, Xty, lambda, p) {
+  # The intercept (home advantage / base scoring level) is never penalised --
+  # shrinking it toward zero would be shrinking toward "no home court".
+  P <- diag(c(rep(lambda, p - 1L), 0))
+  out <- tryCatch(solve(XtX + P, Xty), error = function(e) NULL)
+  if (is.null(out)) NULL else as.numeric(out)
+}
+
+opponent_adjusted_ratings <- function(g,
+                                      lambda    = CFG$model$rating_lambda,
+                                      min_games = CFG$model$rating_min_games) {
+  teams <- sort(unique(c(g$home_team, g$away_team)))
+  ti <- setNames(seq_along(teams), teams)
+  n_teams <- length(teams)
+  p <- n_teams + 1L
+
+  played <- g %>% filter(.data$completed) %>% arrange(.data$date, .data$game_id)
+
+  res <- map_dfr(sort(unique(played$season)), function(s) {
+    gs <- played %>% filter(.data$season == s)
+    if (!nrow(gs)) return(NULL)
+    hi <- ti[gs$home_team]; ai <- ti[gs$away_team]
+
+    XtX_m <- matrix(0, p, p); Xty_m <- numeric(p)   # margin design
+    XtX_t <- matrix(0, p, p); Xty_t <- numeric(p)   # total design
+    n_seen <- 0L
+
+    h_rat <- a_rat <- h_pac <- a_pac <- rep(NA_real_, nrow(gs))
+
+    for (d in sort(unique(gs$date))) {
+      cur <- which(gs$date == d)
+
+      # Fit on everything strictly before this date, then read off today's
+      # teams. No game contributes to its own rating.
+      if (n_seen >= min_games) {
+        bm <- solve_ridge(XtX_m, Xty_m, lambda, p)
+        bt <- solve_ridge(XtX_t, Xty_t, lambda, p)
+        if (!is.null(bm)) { h_rat[cur] <- bm[hi[cur]]; a_rat[cur] <- bm[ai[cur]] }
+        if (!is.null(bt)) { h_pac[cur] <- bt[hi[cur]]; a_pac[cur] <- bt[ai[cur]] }
+      }
+
+      # Only now fold today's results into the accumulator.
+      for (k in cur) {
+        xm <- numeric(p); xm[hi[k]] <-  1; xm[ai[k]] <- -1; xm[p] <- 1
+        xt <- numeric(p); xt[hi[k]] <-  1; xt[ai[k]] <-  1; xt[p] <- 1
+        XtX_m <- XtX_m + tcrossprod(xm); Xty_m <- Xty_m + xm * gs$margin[k]
+        XtX_t <- XtX_t + tcrossprod(xt); Xty_t <- Xty_t + xt * gs$total_points[k]
+      }
+      n_seen <- n_seen + length(cur)
+    }
+
+    tibble(game_id = gs$game_id, h_rating = h_rat, a_rating = a_rat,
+           h_pace_rtg = h_pac, a_pace_rtg = a_pac)
+  })
+
+  info("opponent-adjusted ratings: ", sum(!is.na(res$h_rating)), " of ",
+       nrow(res), " games rated (lambda ", lambda, ")")
+  res
+}
+
+# ===========================================================================
 # 3. Fold team state back onto game rows
 # ===========================================================================
 
@@ -124,6 +206,12 @@ derive_matchup_features <- function(md) {
     rest_diff      = .data$h_rest_days       - .data$a_rest_days,
     b2b_diff       = .data$h_b2b             - .data$a_b2b,
     density_diff   = .data$h_games_last_7    - .data$a_games_last_7,
+
+    # --- opponent-adjusted inputs -------------------------------------------
+    # Present in both the backtest and the live path; NA only before a season
+    # has enough games to fit ratings at all.
+    rating_diff     = .data$h_rating   - .data$a_rating,
+    pace_rating_sum = .data$h_pace_rtg + .data$a_pace_rtg,
 
     # --- total model inputs --------------------------------------------------
     pace_sum       = .data$h_pace_prior      + .data$a_pace_prior,
@@ -147,6 +235,7 @@ build_model_data <- function(g, tg) {
     filter(.data$completed) %>%
     inner_join(side("home_team", "h_"), by = c("game_id", "home_team")) %>%
     inner_join(side("away_team", "a_"), by = c("game_id", "away_team")) %>%
+    left_join(opponent_adjusted_ratings(g), by = "game_id") %>%
     derive_matchup_features() %>%
     mutate(
       # --- market context (opening line only; the close is never an input) ---
@@ -166,12 +255,14 @@ build_model_data <- function(g, tg) {
 # Feature sets handed to the models in 03. Kept short on purpose: with ~1000
 # games per season, a dozen features is already enough to start overfitting.
 FEATURES_MARGIN <- c("net_diff", "form_diff", "prev_net_diff", "win_pct_diff",
-                     "rest_diff", "b2b_diff", "density_diff")
+                     "rest_diff", "b2b_diff", "density_diff",
+                     "rating_diff")
 # def_sum is deliberately absent: pace_sum == off_sum + def_sum exactly, so
 # including all three makes the design matrix singular and lm silently returns
 # an NA coefficient. Any two of them carry the same information.
 FEATURES_TOTAL  <- c("pace_sum", "form_total_sum", "off_sum",
-                     "rest_sum", "b2b_any")
+                     "rest_sum", "b2b_any",
+                     "pace_rating_sum")
 
 # Optional market anchors -- see CFG$model$use_market_features.
 FEATURES_MARGIN_MARKET <- c(FEATURES_MARGIN, "spread_open")

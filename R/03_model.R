@@ -32,9 +32,9 @@ feature_sets <- function() {
 # Feature vectors live in 02; reload it if this script is run on its own.
 if (!exists("FEATURES_TOTAL")) {
   FEATURES_TOTAL  <- c("pace_sum", "form_total_sum", "off_sum",
-                       "rest_sum", "b2b_any")
+                       "rest_sum", "b2b_any", "pace_rating_sum")
   FEATURES_MARGIN <- c("net_diff", "form_diff", "prev_net_diff", "win_pct_diff",
-                       "rest_diff", "b2b_diff", "density_diff")
+                       "rest_diff", "b2b_diff", "density_diff", "rating_diff")
   FEATURES_TOTAL_MARKET  <- c(FEATURES_TOTAL,  "total_open")
   FEATURES_MARGIN_MARKET <- c(FEATURES_MARGIN, "spread_open")
 }

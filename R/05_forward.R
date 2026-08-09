@@ -236,7 +236,8 @@ consensus_lines <- function(od) {
 # a given historical game.
 
 latest_team_state <- function(tg, as_of = Sys.Date(),
-                              form_window = CFG$model$form_window) {
+                              form_window = CFG$model$form_window,
+                              games = NULL) {
   season <- max(tg$season, na.rm = TRUE)
   cur <- tg %>% filter(.data$season == !!season, .data$date < as_of) %>%
     arrange(.data$team, .data$date)
@@ -265,12 +266,50 @@ latest_team_state <- function(tg, as_of = Sys.Date(),
       games_last_7    = sum(.data$date > as_of - 7),
       .groups = "drop"
     ) %>%
-    mutate(net_prior = .data$pf_prior - .data$pa_prior)
+    mutate(net_prior = .data$pf_prior - .data$pa_prior) %>%
+    left_join(
+      latest_ratings(if (is.null(games)) readRDS(CFG$paths$games_rds) else games,
+                     as_of = as_of),
+      by = "team")
 }
 
 STATE_COLS <- c("gp_prior", "win_pct_prior", "pf_prior", "pa_prior", "net_prior",
                 "pace_prior", "form_margin", "form_total", "prev_season_net",
-                "last_game", "games_last_7")
+                "last_game", "games_last_7", "rating", "pace_rtg")
+
+# Opponent-adjusted ratings as of today, fitted on the current season's
+# completed games. Same ridge design as 02_features.R -- the live path and the
+# backtest have to build this feature identically or the backtest is measuring
+# a different model than the one placing bets.
+latest_ratings <- function(g, as_of = Sys.Date(),
+                           lambda    = CFG$model$rating_lambda,
+                           min_games = CFG$model$rating_min_games) {
+  season <- max(g$season, na.rm = TRUE)
+  gs <- g %>% filter(.data$season == !!season, .data$completed, .data$date < as_of)
+  teams <- sort(unique(c(g$home_team, g$away_team)))
+  blank <- tibble(team = teams, rating = NA_real_, pace_rtg = NA_real_)
+  if (nrow(gs) < min_games) {
+    warn("only ", nrow(gs), " completed games this season -- ratings not fitted ",
+         "(need ", min_games, ")")
+    return(blank)
+  }
+
+  ti <- setNames(seq_along(teams), teams); p <- length(teams) + 1L
+  hi <- ti[gs$home_team]; ai <- ti[gs$away_team]
+  XtX_m <- matrix(0, p, p); Xty_m <- numeric(p)
+  XtX_t <- matrix(0, p, p); Xty_t <- numeric(p)
+  for (k in seq_len(nrow(gs))) {
+    xm <- numeric(p); xm[hi[k]] <-  1; xm[ai[k]] <- -1; xm[p] <- 1
+    xt <- numeric(p); xt[hi[k]] <-  1; xt[ai[k]] <-  1; xt[p] <- 1
+    XtX_m <- XtX_m + tcrossprod(xm); Xty_m <- Xty_m + xm * gs$margin[k]
+    XtX_t <- XtX_t + tcrossprod(xt); Xty_t <- Xty_t + xt * gs$total_points[k]
+  }
+  bm <- solve_ridge(XtX_m, Xty_m, lambda, p)
+  bt <- solve_ridge(XtX_t, Xty_t, lambda, p)
+  tibble(team = teams,
+         rating   = if (is.null(bm)) NA_real_ else bm[seq_along(teams)],
+         pace_rtg = if (is.null(bt)) NA_real_ else bt[seq_along(teams)])
+}
 
 build_upcoming <- function(lines, state) {
   side <- function(prefix) {

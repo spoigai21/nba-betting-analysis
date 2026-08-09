@@ -47,6 +47,18 @@ CFG <- list(
     # Rolling-form window (games).
     form_window = 10,
 
+    # --- opponent-adjusted ratings -------------------------------------------
+    # Ridge penalty for the team ratings fitted in 02_features.R. Read it as
+    # "how many games of average play a team must post before its rating is
+    # believed": at 10, a team twenty games in sits about a third of the way
+    # back toward league average.
+    rating_lambda = 10,
+
+    # Games a season must have on the board before ratings are fitted at all.
+    # Thirty teams and a home-advantage term is 31 parameters; below this the
+    # fit is mostly penalty.
+    rating_min_games = 60,
+
     # Backtesting is walk-forward: train on everything strictly before the test
     # season, predict that season, then roll forward. This is the first season
     # that gets predicted (needs at least one full prior season to train on).
