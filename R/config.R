@@ -166,7 +166,10 @@ CFG <- list(
   # Used by 99_make_sample_data.R so the pipeline runs before you have a real
   # CSV. The simulated market is deliberately near-efficient.
   sample = list(
-    seasons      = 2022:2025,
+    # NBA seasons are labelled by ending year, so 2026 is the 2025-26 season.
+    # Keep this current: a synthetic set that stops two seasons back silently
+    # trains and tests the pipeline on an era the live path no longer sees.
+    seasons      = 2023:2026,
     games_per_season = 1230,
     home_advantage   = 2.4,      # points
     margin_sd        = 11.5,

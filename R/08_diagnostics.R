@@ -244,6 +244,144 @@ calibration_report <- function(d) {
 }
 
 # ===========================================================================
+# 4b. Forecast encompassing -- the question accuracy cannot answer
+# ===========================================================================
+# RMSE asks "is our number closer?" and the answer here is no -- the closing
+# line beats us on both targets. That is the wrong question to stop on.
+#
+# The right one is whether our number carries information the line does NOT,
+# and those are different things. A forecast can be worse overall and still be
+# useful, if its errors are made in different places than the market's; a
+# forecast can also be nearly as accurate as the market and yet be worthless,
+# because it is only re-deriving what the line already says.
+#
+# The standard test is an encompassing regression:
+#
+#     actual ~ market_prediction + model_prediction
+#
+# If the market encompasses the model, the model's coefficient collapses to
+# zero -- once you know the line, our number adds nothing. A coefficient
+# reliably away from zero means genuinely independent information.
+#
+# TWO WARNINGS, both load-bearing:
+#   * Independent information is NECESSARY for an edge, not SUFFICIENT. The
+#     information still has to be worth more than the vig, and this regression
+#     says nothing about that. 04_backtest.R is where that gets decided.
+#   * The two predictors are heavily collinear by construction -- both are
+#     estimates of the same quantity -- which inflates the standard errors.
+#     A small coefficient with a wide interval is genuinely inconclusive, not
+#     evidence of absence.
+
+encompassing_report <- function(d) {
+  step("Forecast encompassing: does the model know anything the line does not?")
+
+  d$market_margin <- -d$spread_close
+  targets <- list(
+    total  = list(actual = "total_points", model = "pred_total",  market = "total_close"),
+    margin = list(actual = "margin",       model = "pred_margin", market = "market_margin")
+  )
+
+  fit_one <- function(dd) {
+    fit <- lm(actual ~ market + model, data = dd)
+    co  <- summary(fit)$coefficients
+    ci  <- confint(fit)
+    list(fit = fit,
+         beta_market = co["market", "Estimate"],
+         beta_model  = co["model",  "Estimate"],
+         lo = ci["model", 1], hi = ci["model", 2],
+         p  = co["model", "Pr(>|t|)"])
+  }
+
+  out <- map_dfr(names(targets), function(tg) {
+    sp <- targets[[tg]]
+    dd <- tibble(actual = d[[sp$actual]], model = d[[sp$model]],
+                 market = d[[sp$market]], season = d$season) %>%
+      filter(!is.na(.data$actual), !is.na(.data$model), !is.na(.data$market))
+    if (nrow(dd) < 200) return(NULL)
+
+    f <- fit_one(dd)
+    tibble(
+      target = tg, n = nrow(dd),
+      beta_market = f$beta_market, beta_model = f$beta_model,
+      model_lo = f$lo, model_hi = f$hi, p_model = f$p,
+      # How much of our number is a restatement of the line.
+      cor_preds   = cor(dd$market, dd$model),
+      rmse_market = rmse(dd$actual, dd$market),
+      rmse_model  = rmse(dd$actual, dd$model),
+      rmse_comb   = rmse(dd$actual, fitted(f$fit))
+    )
+  })
+
+  if (!nrow(out)) { warn("not enough out-of-sample forecasts to test"); return(invisible(out)) }
+
+  message(sprintf("   %-8s %6s %8s %8s %-22s %8s %8s",
+                  "target", "n", "b(mkt)", "b(model)", "model 95% CI", "p", "cor"))
+  for (i in seq_len(nrow(out))) {
+    r <- out[i, ]
+    message(sprintf("   %-8s %6d %8.3f %8.3f  [%+.3f, %+.3f]%s %8.4f %8.3f",
+                    r$target, r$n, r$beta_market, r$beta_model, r$model_lo, r$model_hi,
+                    if (r$model_lo > 0 || r$model_hi < 0) " *" else "  ",
+                    r$p_model, r$cor_preds))
+  }
+  message("   * = the model's coefficient interval excludes zero")
+
+  message("\n   accuracy, for contrast (RMSE, lower is better):")
+  for (i in seq_len(nrow(out))) {
+    r <- out[i, ]
+    message(sprintf("     %-8s market %6.2f   model %6.2f   fitted blend %6.2f",
+                    r$target, r$rmse_market, r$rmse_model, r$rmse_comb))
+  }
+  message("   The blend is fitted in-sample on these same forecasts. With two")
+  message("   parameters over thousands of games the optimism is small, but it")
+  message("   is an upper bound, not an achievable result.")
+
+  # --- stability across seasons -------------------------------------------
+  # A coefficient that changes sign season to season is noise wearing a
+  # p-value. One that holds its sign is worth acting on.
+  message("")
+  for (tg in names(targets)) {
+    sp <- targets[[tg]]
+    dd <- tibble(actual = d[[sp$actual]], model = d[[sp$model]],
+                 market = d[[sp$market]], season = d$season) %>%
+      filter(!is.na(.data$actual), !is.na(.data$model), !is.na(.data$market))
+    per <- map_dfr(split(dd, dd$season), function(g) {
+      if (nrow(g) < 150) return(NULL)
+      f <- fit_one(g)
+      tibble(season = g$season[1], beta_model = f$beta_model)
+    })
+    if (nrow(per) > 1)
+      info(tg, " model coefficient by season: ",
+           paste(sprintf("%d %+.2f", per$season, per$beta_model), collapse = "  "),
+           if (length(unique(sign(per$beta_model))) == 1)
+             "  (sign stable)" else "  (SIGN FLIPS -- treat as noise)")
+  }
+
+  # --- verdict -------------------------------------------------------------
+  message("")
+  informative <- out %>% filter(.data$model_lo > 0 | .data$model_hi < 0)
+  if (!nrow(informative)) {
+    message("   The closing line encompasses the model on every target: once you")
+    message("   know the line, our number adds nothing measurable. That is the")
+    message("   expected result, and it says the feature set is re-deriving what")
+    message("   the market already prices rather than finding anything new.")
+    message("   Adding features in the same family will not change this. The way")
+    message("   out is a signal the line demonstrably lacks -- which is what the")
+    message("   news and availability work in 06/07 is for.")
+  } else {
+    for (i in seq_len(nrow(informative))) {
+      r <- informative[i, ]
+      message(sprintf(
+        "   %s: the model's coefficient is %+.3f with the interval clear of zero.",
+        r$target, r$beta_model))
+    }
+    message("   That is independent information, and it is the precondition for")
+    message("   an edge. It is NOT yet an edge: 04_backtest.R decides whether it")
+    message("   survives the vig, and the forward test decides whether it is real.")
+  }
+  invisible(out)
+}
+
+# ===========================================================================
 # 5. ROI by segment -- reported last, and deliberately hedged
 # ===========================================================================
 
@@ -376,6 +514,7 @@ info(nrow(seg), " out-of-sample games across ", length(DIMENSIONS),
 
 seg_stats <- segment_table(seg)
 seg_stats <- report_segments(seg_stats, "Bias and skill by segment")
+encompassing <- encompassing_report(seg)
 calibration_report(seg)
 
 bets_path <- file.path(CFG$paths$output_dir, "backtest_bets.csv")

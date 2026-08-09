@@ -50,9 +50,17 @@ USAGE <- list(
             "three_point_field_goals_made", "field_goals_attempted")
 )
 
-default_seasons <- function() {
-  s <- year(Sys.Date()) + (month(Sys.Date()) >= 8)
-  c(s - 1L, s)
+# The two seasons worth pulling, given today's date.
+#
+# A season labelled S runs from October of S-1 to June of S. Between the end of
+# one season and the start of the next -- roughly late June to late October --
+# season_of() already reports the NEXT season, which has not played a game.
+# Asking hoopR for it returns nothing, so during the offseason the useful pair
+# is the two seasons that actually finished.
+default_seasons <- function(today = Sys.Date()) {
+  s <- year(today) + (month(today) >= 8)
+  started <- today >= as.Date(sprintf("%d-10-15", s - 1L))
+  if (started) c(s - 1L, s) else c(s - 2L, s - 1L)
 }
 
 # ===========================================================================

@@ -86,8 +86,54 @@ tidy_odds <- function(raw) {
   })
 }
 
-# One line per game. Books disagree by half a point; the median across books is
-# a more stable "the market" than any single shop.
+# The single best quote a bettor could actually take, per event and side.
+#
+# `point_dir` says which direction is better for the side being quoted:
+#   +1  more points is better -- either side of a spread (the feed quotes each
+#       outcome its own number, so higher is always better for that outcome),
+#       and the UNDER of a total
+#   -1  fewer points is better -- the OVER of a total
+#    0  there is no number at all, only a price -- the moneyline
+#
+# Ties on the number break on price. The result is one real, placeable bet at
+# one book, which is the entire point: you cannot bet the median of the market.
+#
+# CONVENTION, and its limit: the best NUMBER wins first, and price only breaks
+# ties. That deliberately does not solve the number-versus-juice trade-off --
+# whether -4 at -115 beats -4.5 at -105 depends on how much probability mass
+# sits on a 4-point margin, which needs a model this function does not have.
+# Taking the number first is the standard convention and is the conservative
+# half of the trade (a better number can only help; cheaper juice on a worse
+# number can lose outright).
+pick_best_quote <- function(d, point_dir) {
+  out <- d %>%
+    filter(!is.na(.data$price)) %>%
+    mutate(.rank = if (point_dir == 0) 0 else point_dir * .data$point,
+           .dec  = american_to_decimal(.data$price)) %>%
+    group_by(.data$event_id) %>%
+    arrange(desc(.data$.rank), desc(.data$.dec), .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup()
+  if (!nrow(out))
+    return(tibble(event_id = character(), point = numeric(),
+                  price = numeric(), book = character()))
+  out %>% select("event_id", "point", "price", "book")
+}
+
+# One row per game, carrying TWO different views of the market:
+#
+#   consensus  the median number and price across books. This is the best
+#              available estimate of fair value, and it is what a bet is
+#              SELECTED against -- disagreeing with the middle of the market is
+#              the honest test, and it keeps the selection rule conservative.
+#
+#   best       the single best number and price actually on offer, with the
+#              book that offers it. This is what the bet is EXECUTED and LOGGED
+#              at, because it is the only one you could really have taken.
+#
+# Collapsing these two into one number -- as this function used to, logging the
+# median as though it were the price paid -- understates every result by the
+# spread between the middle of the market and its best shop.
 consensus_lines <- function(od) {
   if (!nrow(od)) return(tibble())
   if (!is.null(CFG$odds_api$bookmaker)) {
@@ -137,12 +183,50 @@ consensus_lines <- function(od) {
     if (!cc %in% names(h2h)) h2h[[cc]] <- NA_real_
   h2h <- h2h %>% select("event_id", "ml_home", "ml_away")
 
-  od %>%
+  # --- best executable quote per side --------------------------------------
+  sp_side <- od %>% filter(.data$market == "spreads") %>%
+    mutate(side = if_else(.data$name == .data$home_team, "home", "away"))
+  tot_side <- od %>% filter(.data$market == "totals") %>%
+    mutate(side = tolower(.data$raw_name))
+  ml_side <- od %>% filter(.data$market == "h2h") %>%
+    mutate(side = if_else(.data$name == .data$home_team, "home", "away"))
+
+  best <- list(
+    pick_best_quote(sp_side %>% filter(.data$side == "home"), 1) %>%
+      rename(best_spread_home = "point", best_price_spread_home = "price",
+             best_book_spread_home = "book"),
+    pick_best_quote(sp_side %>% filter(.data$side == "away"), 1) %>%
+      rename(best_spread_away = "point", best_price_spread_away = "price",
+             best_book_spread_away = "book"),
+    # An over wants the lowest total on the board; an under the highest.
+    pick_best_quote(tot_side %>% filter(.data$side == "over"), -1) %>%
+      rename(best_total_over = "point", best_price_over = "price",
+             best_book_over = "book"),
+    pick_best_quote(tot_side %>% filter(.data$side == "under"), 1) %>%
+      rename(best_total_under = "point", best_price_under = "price",
+             best_book_under = "book"),
+    pick_best_quote(ml_side %>% filter(.data$side == "home"), 0) %>%
+      select(-"point") %>%
+      rename(best_ml_home = "price", best_book_ml_home = "book"),
+    pick_best_quote(ml_side %>% filter(.data$side == "away"), 0) %>%
+      select(-"point") %>%
+      rename(best_ml_away = "price", best_book_ml_away = "book")
+  ) %>% reduce(full_join, by = "event_id")
+
+  out <- od %>%
     distinct(.data$event_id, .data$commence, .data$home_team, .data$away_team) %>%
     left_join(spreads, by = "event_id") %>%
     left_join(totals,  by = "event_id") %>%
     left_join(h2h,     by = "event_id") %>%
+    left_join(best,    by = "event_id") %>%
     mutate(date = as.Date(.data$commence, tz = Sys.timezone()))
+
+  n_shopped <- sum(!is.na(out$best_book_spread_home) | !is.na(out$best_book_over),
+                   na.rm = TRUE)
+  if (n_shopped)
+    info("best-price shopping across ", n_distinct(od$book), " book(s) on ",
+         n_shopped, " game(s)")
+  out
 }
 
 # ===========================================================================
@@ -269,9 +353,52 @@ to_track_rows <- function(p, ts = Sys.time()) {
   stamp <- format(as.POSIXct(ts), "%Y-%m-%d %H:%M:%S %Z")
   gname <- function(d) paste0(d$away_team, " @ ", d$home_team)
 
+  # Every execution field falls back to the consensus quote, so a feed that
+  # returns a single book -- or a test harness that supplies only consensus
+  # columns -- still produces correct rows.
+  for (cc in c("best_total_over", "best_total_under", "best_price_over",
+               "best_price_under", "best_spread_home", "best_spread_away",
+               "best_price_spread_home", "best_price_spread_away",
+               "best_ml_home", "best_ml_away")) {
+    if (!cc %in% names(p)) p[[cc]] <- NA_real_
+  }
+  for (cc in c("best_book_over", "best_book_under", "best_book_spread_home",
+               "best_book_spread_away", "best_book_ml_home", "best_book_ml_away")) {
+    if (!cc %in% names(p)) p[[cc]] <- NA_character_
+  }
+
+  # Append the executing book, and the consensus number when it differs from
+  # the number taken, so the log shows what was shopped and by how much.
+  exec_note <- function(base, book, taken, consensus) {
+    tag <- if_else(is.na(book), NA_character_,
+                   if_else(is.na(consensus) | abs(taken - consensus) < 1e-9,
+                           paste0("@ ", book),
+                           paste0("@ ", book, " (consensus ", consensus, ")")))
+    if_else(is.na(base), tag,
+            if_else(is.na(tag), base, paste0(base, " | ", tag)))
+  }
+
   totals <- p %>%
     filter(!is.na(.data$edge_total),
            abs(.data$edge_total) >= CFG$backtest$total_edge_threshold) %>%
+    mutate(
+      # The SIDE is chosen against the consensus number -- the honest test of
+      # whether we disagree with the middle of the market. Only then does
+      # execution take the best number and price on offer for that side.
+      side = if_else(.data$edge_total > 0, "over", "under"),
+      exec_line = coalesce(if_else(.data$side == "over",
+                                   .data$best_total_over, .data$best_total_under),
+                           .data$total_current),
+      exec_odds = coalesce(if_else(.data$side == "over",
+                                   .data$best_price_over, .data$best_price_under),
+                           if_else(.data$side == "over",
+                                   .data$price_over, .data$price_under),
+                           CFG$backtest$default_price),
+      exec_book = if_else(.data$side == "over",
+                          .data$best_book_over, .data$best_book_under),
+      # The realised edge is against the number actually taken, not the median.
+      exec_edge = .data$pred_total_final - .data$exec_line
+    ) %>%
     transmute(
       .data$date,
       game = gname(.),
@@ -283,20 +410,39 @@ to_track_rows <- function(p, ts = Sys.time()) {
       prediction     = round(.data$pred_total_final, 1),
       prediction_raw = round(.data$pred_total, 1),
       news_adj       = round(.data$news_total_adj, 2),
-      line = .data$total_current,
-      odds = coalesce(if_else(.data$edge_total > 0, .data$price_over, .data$price_under),
-                      CFG$backtest$default_price),
-      bet  = if_else(.data$edge_total > 0, "over", "under"),
+      line = .data$exec_line,
+      odds = .data$exec_odds,
+      bet  = .data$side,
       result = NA_real_, win_loss = NA_character_, units = NA_real_,
       timestamp = stamp,
-      market = "total", edge = round(.data$edge_total, 2),
+      market = "total", edge = round(.data$exec_edge, 2),
       model_version = MODEL_VERSION, event_id = .data$event_id,
-      line_close = NA_real_, clv_points = NA_real_, notes = .data$news_note
+      line_close = NA_real_, clv_points = NA_real_,
+      notes = exec_note(.data$news_note, .data$exec_book,
+                        .data$exec_line, .data$total_current)
     )
 
   spreads <- p %>%
     filter(!is.na(.data$edge_spread),
            abs(.data$edge_spread) >= CFG$backtest$spread_edge_threshold) %>%
+    mutate(
+      side = if_else(.data$edge_spread > 0, "home", "away"),
+      # A spread is logged from the home side throughout this project, so an
+      # away bet taken at +5.5 is recorded as a home line of -5.5. Getting this
+      # negation wrong would silently invert every away-side settlement.
+      exec_line = coalesce(if_else(.data$side == "home",
+                                   .data$best_spread_home, -.data$best_spread_away),
+                           .data$spread_current),
+      exec_odds = coalesce(if_else(.data$side == "home",
+                                   .data$best_price_spread_home,
+                                   .data$best_price_spread_away),
+                           if_else(.data$side == "home",
+                                   .data$price_spread_home, .data$price_spread_away),
+                           CFG$backtest$default_price),
+      exec_book = if_else(.data$side == "home",
+                          .data$best_book_spread_home, .data$best_book_spread_away),
+      exec_edge = .data$exec_line - .data$model_spread
+    ) %>%
     transmute(
       .data$date,
       game = gname(.),
@@ -305,15 +451,16 @@ to_track_rows <- function(p, ts = Sys.time()) {
       prediction     = round(.data$pred_margin_final, 1),
       prediction_raw = round(.data$pred_margin, 1),
       news_adj       = round(.data$news_margin_adj, 2),
-      line = .data$spread_current,
-      odds = coalesce(if_else(.data$edge_spread > 0, .data$price_spread_home,
-                              .data$price_spread_away), CFG$backtest$default_price),
-      bet  = if_else(.data$edge_spread > 0, "home", "away"),
+      line = .data$exec_line,
+      odds = .data$exec_odds,
+      bet  = .data$side,
       result = NA_real_, win_loss = NA_character_, units = NA_real_,
       timestamp = stamp,
-      market = "spread", edge = round(.data$edge_spread, 2),
+      market = "spread", edge = round(.data$exec_edge, 2),
       model_version = MODEL_VERSION, event_id = .data$event_id,
-      line_close = NA_real_, clv_points = NA_real_, notes = .data$news_note
+      line_close = NA_real_, clv_points = NA_real_,
+      notes = exec_note(.data$news_note, .data$exec_book,
+                        .data$exec_line, .data$spread_current)
     )
 
   # --- moneyline ----------------------------------------------------------
@@ -324,11 +471,29 @@ to_track_rows <- function(p, ts = Sys.time()) {
   # to measure closing-line value against.
   moneyline <- NULL
   if (all(c("ml_home", "ml_away") %in% names(p)) && nrow(p)) {
+    # Selection runs on the CONSENSUS prices: the de-vigged fair probability
+    # comes from the middle of the market, and the EV threshold is tested at
+    # the middle of the market too. Executing at a better price can only raise
+    # the true EV, so this keeps the guard conservative.
     mlp <- moneyline_pick(p$win_prob_final, p$ml_home, p$ml_away)
     moneyline <- p %>%
       mutate(ml_side = mlp$side, ml_edge = mlp$edge, ml_ev = mlp$ev,
-             ml_price = mlp$price, ml_pmkt = mlp$p_market) %>%
+             ml_price = mlp$price, ml_pmkt = mlp$p_market,
+             ml_pshrunk = mlp$p_model_shrunk) %>%
       filter(!is.na(.data$ml_side)) %>%
+      mutate(
+        exec_odds = coalesce(if_else(.data$ml_side == "home",
+                                     .data$best_ml_home, .data$best_ml_away),
+                             .data$ml_price),
+        exec_book = if_else(.data$ml_side == "home",
+                            .data$best_book_ml_home, .data$best_book_ml_away),
+        # EV restated at the price actually taken, under the same haircut the
+        # selection rule used.
+        exec_ev = bet_ev(if_else(.data$ml_side == "home",
+                                 .data$ml_pshrunk, 1 - .data$ml_pshrunk) -
+                           CFG$backtest$ml_prob_error,
+                         .data$exec_odds)
+      ) %>%
       transmute(
         .data$date,
         game = gname(.),
@@ -337,8 +502,10 @@ to_track_rows <- function(p, ts = Sys.time()) {
         prediction     = round(.data$win_prob_final, 4),
         prediction_raw = round(.data$pred_win_prob, 4),
         news_adj       = round(.data$win_prob_final - .data$pred_win_prob, 4),
+        # `line` stays the consensus de-vigged probability: it is the market's
+        # fair view, and it is what record_closing_lines() measures CLV against.
         line = round(.data$ml_pmkt, 4),
-        odds = .data$ml_price,
+        odds = .data$exec_odds,
         bet  = .data$ml_side,
         result = NA_real_, win_loss = NA_character_, units = NA_real_,
         timestamp = stamp,
@@ -347,10 +514,12 @@ to_track_rows <- function(p, ts = Sys.time()) {
         line_close = NA_real_, clv_points = NA_real_,
         # paste0() renders NA as the string "NA", which would write a literal
         # "NAev +0.03" into a permanent record. Branch instead of pasting.
-        notes = if_else(is.na(.data$news_note),
-                        paste0("ev ", sprintf("%+.3f", .data$ml_ev)),
-                        paste0(.data$news_note, " | ev ",
-                               sprintf("%+.3f", .data$ml_ev)))
+        notes = {
+          ev <- paste0("ev ", sprintf("%+.3f", .data$exec_ev))
+          ev <- if_else(is.na(.data$exec_book), ev,
+                        paste0(ev, " @ ", .data$exec_book))
+          if_else(is.na(.data$news_note), ev, paste0(.data$news_note, " | ", ev))
+        }
       )
   }
 

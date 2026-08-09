@@ -265,6 +265,75 @@ ok(pick_ok$price == -120 && pick_ok$price_alt == 100,
 eq(moneyline_pick(0.62, NA, NA)$side, NA_character_, "no price means no bet")
 
 # ===========================================================================
+section("Line shopping -- fair value vs execution price")
+# ===========================================================================
+# The market's median is the right estimate of fair value and the wrong thing
+# to log as the price paid: you cannot bet the median. These pin the split.
+
+suppressMessages(suppressWarnings(source("R/05_forward.R")))
+
+mkq <- function(book, market, name, raw, price, point) tibble(
+  event_id = "ev1", commence = as.POSIXct("2026-11-01 23:00:00", tz = "UTC"),
+  home_team = "BOS", away_team = "LAL", book = book, market = market,
+  name = name, raw_name = raw, price = price, point = point)
+
+od_fix <- bind_rows(
+  mkq("A","spreads","BOS","BOS",-110,-4.5), mkq("A","spreads","LAL","LAL",-110, 4.5),
+  mkq("B","spreads","BOS","BOS",-115,-4.0), mkq("B","spreads","LAL","LAL",-105, 4.0),
+  mkq("C","spreads","BOS","BOS",-105,-4.5), mkq("C","spreads","LAL","LAL",-115, 4.5),
+  mkq("A","totals","Over","Over",-110,224.5), mkq("A","totals","Under","Under",-110,224.5),
+  mkq("B","totals","Over","Over",-108,225.0), mkq("B","totals","Under","Under",-112,225.0),
+  mkq("C","totals","Over","Over",-120,224.5), mkq("C","totals","Under","Under", 100,224.5),
+  mkq("A","h2h","BOS","BOS",-190,NA), mkq("A","h2h","LAL","LAL", 160,NA),
+  mkq("B","h2h","BOS","BOS",-175,NA), mkq("B","h2h","LAL","LAL", 155,NA),
+  mkq("C","h2h","BOS","BOS",-200,NA), mkq("C","h2h","LAL","LAL", 172,NA))
+
+cl <- suppressMessages(consensus_lines(od_fix))
+
+eq(cl$spread_current, -4.5, "consensus spread is the median across books")
+eq(cl$total_current, 224.5, "consensus total is the median across books")
+
+# Best NUMBER first. A home bet wants the most points it can get.
+eq(cl$best_spread_home, -4.0, "home spread shops to the best number (-4.0, not -4.5)")
+eq(cl$best_book_spread_home, "B", "and names the book offering it")
+eq(cl$best_spread_away, 4.5, "away spread shops to the best number (+4.5)")
+# Both A and C offer +4.5; A is -110 and C is -115, so price breaks the tie.
+eq(cl$best_book_spread_away, "A", "price breaks a tie on equal numbers (-110 beats -115)")
+
+# Totals run in opposite directions by side.
+eq(cl$best_total_over, 224.5, "an over wants the LOWEST total on the board")
+eq(cl$best_book_over, "A", "and the best price among books at that total")
+eq(cl$best_total_under, 225.0, "an under wants the HIGHEST total on the board")
+
+# Moneyline has no number, only a price.
+eq(cl$best_ml_home, -175, "moneyline shops to the best home price")
+eq(cl$best_ml_away, 172, "moneyline shops to the best away price")
+ok(american_to_decimal(cl$best_ml_home) > american_to_decimal(cl$ml_home),
+   "the shopped price is strictly better than the consensus price")
+
+# A single-book feed must still work, with best == consensus.
+one <- suppressMessages(consensus_lines(od_fix %>% filter(.data$book == "A")))
+eq(one$best_spread_home, one$spread_current, "one book: best number equals consensus")
+eq(one$best_ml_home, one$ml_home, "one book: best price equals consensus")
+
+# ===========================================================================
+section("Season selection during the offseason")
+# ===========================================================================
+# Between June and October, season_of() already names the NEXT season, which
+# has not played a game. Asking hoopR for it returns nothing.
+
+suppressMessages(suppressWarnings(source("R/07_usage_model.R")))
+
+eq(default_seasons(as.Date("2026-08-09")), c(2025L, 2026L),
+   "in August, the two COMPLETED seasons are returned")
+eq(default_seasons(as.Date("2026-11-01")), c(2026L, 2027L),
+   "in November, the season under way is included")
+eq(default_seasons(as.Date("2026-10-14")), c(2025L, 2026L),
+   "just before tip-off the unstarted season is still excluded")
+eq(default_seasons(as.Date("2027-03-01")), c(2026L, 2027L),
+   "mid-season returns the current season and the one before it")
+
+# ===========================================================================
 section("Track record -- append-only guarantees")
 # ===========================================================================
 

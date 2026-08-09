@@ -290,6 +290,14 @@ ODDS_API_KEY=your_key_here
 `log_predictions()` only ever appends, never rewrites a logged prediction, and
 `update_results()` only fills blank cells. That is what makes the record auditable.
 
+**Fair value and execution price are separate things.** The median across books
+is the best estimate of what a game is worth, and it is what a bet is *selected*
+against — disagreeing with the middle of the market is the honest test. But you
+cannot bet the median. Each bet is *executed and logged* at the best number and
+price actually on offer, with the book recorded in `notes`. Collapsing the two,
+as this code originally did, understates every result by the spread between the
+middle of the market and its best shop.
+
 It logs all three markets, and it applies your news reads from
 `data/manual_news.csv` on the way through (`use_news = FALSE` to turn that off
 for a run). The adjustment moves the expected margin *and* the win probability
@@ -386,6 +394,25 @@ data before trusting it — and note this measures accuracy, not edge: the free 
 carries no prop lines to beat.
 
 ### Diagnostics: where does it fail?
+
+The headline test is **forecast encompassing** — regressing the actual result on
+the closing line *and* the model together:
+
+```
+actual ~ market_prediction + model_prediction
+```
+
+RMSE asks "is our number closer?", and the answer is no on both targets. That is
+the wrong question to stop on. A forecast can be worse overall and still be
+useful if it errs in different places than the market; it can also be nearly as
+accurate and still be worthless, because it is only re-deriving the line. The
+encompassing coefficient separates the two. If the market encompasses the model,
+that coefficient collapses to zero.
+
+Two caveats travel with it. Independent information is *necessary* for an edge,
+not sufficient — it still has to beat the vig, which `04_backtest.R` decides. And
+the two predictors are heavily collinear by construction, so a small coefficient
+with a wide interval is inconclusive rather than evidence of absence.
 
 Runs as part of `run_all.R`, or on its own:
 
