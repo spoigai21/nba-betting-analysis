@@ -153,6 +153,49 @@ CFG <- list(
     max_abs_impact = 8.0
   ),
 
+  # --- LLM strategy-signal extraction (09) ----------------------------------
+  # Deliberately NOT used for "who is out". ESPN tags articles with the same
+  # athlete ids the box scores use, so entity resolution is already exact, and
+  # injury-report prose is formulaic enough for the pattern rules in 06. The
+  # model is pointed at the part regex cannot do: coach-revealed rotation and
+  # minutes intentions.
+  llm = list(
+    model    = "claude-opus-5",
+    effort   = "low",          # extraction from one short article
+    api_key_env = "ANTHROPIC_API_KEY",
+    base     = "https://api.anthropic.com/v1/messages",
+    version  = "2023-06-01",
+    max_tokens = 4000,
+
+    # Every extraction is cached by (article, prompt version, model) and the
+    # cache is committed. An LLM call is not reproducible; a cache of its
+    # answers is. Nothing is ever re-queried for an article already seen, so
+    # re-running the pipeline cannot change a logged extraction.
+    cache    = "data/llm_news_cache.jsonl",
+
+    # Below this, a signal is recorded but not surfaced as actionable.
+    min_confidence = 0.6
+  ),
+
+  # --- SportsDataIO: structured availability (optional, paid) ---------------
+  # hoopR exposes ESPN roster status, which is a substitute for an injury feed
+  # rather than one. SportsDataIO sells the real thing: probable / questionable
+  # / doubtful / out, refreshed several times a day, plus lineup projections.
+  # Free trial is 1,000 calls a month -- about 33 a day, ample for one pull.
+  #
+  # AUTH is verified: the key goes in an Ocp-Apim-Subscription-Key header (a
+  # ?key= query parameter also works).
+  #
+  # THE PATH IS NOT VERIFIED. SportsDataIO does not publish the NBA injury
+  # endpoint outside an account, and guessing it into production code would be
+  # a silent 404 waiting to happen. Check it in your account's API explorer and
+  # correct it here; fetch_sdio_injuries() reports clearly when it is wrong.
+  sportsdataio = list(
+    base          = "https://api.sportsdata.io/v3/nba",
+    injuries_path = "scores/json/Injuries",   # <- VERIFY against your account
+    key_env       = "SPORTSDATAIO_API_KEY"
+  ),
+
   # --- Diagnostics (08) -----------------------------------------------------
   diagnostics = list(
     # A segment needs this many rows before it is reported at all.

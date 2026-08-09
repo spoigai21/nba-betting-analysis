@@ -79,6 +79,7 @@ nba-market-model/
 │   ├── 06_news_signals.R   # (advanced) injury/lineup news + NLP extraction
 │   ├── 07_usage_model.R    # who absorbs usage when a player sits -> props
 │   ├── 08_diagnostics.R    # where does it fail? (Phase 5 hypothesis generator)
+│   ├── 09_llm_news.R       # coach-revealed strategy signals (LLM, cached)
 │   └── 99_make_sample_data.R  # synthetic dataset, for running without Kaggle
 ├── tests/
 │   ├── run_tests.R         # odds maths, settlement signs, no-look-ahead, schemas
@@ -95,11 +96,12 @@ nba-market-model/
 Rscript tests/run_tests.R
 ```
 
-177 checks over the arithmetic that would be invisible if it were wrong: odds
+199 checks over the arithmetic that would be invisible if it were wrong: odds
 conversion, settlement sign conventions, CLV signs, the no-look-ahead property
 of the rolling features, column detection against real-world header shapes,
 best-price selection across books, magnitude-plus-favourite spread rebuilding,
-and the append-only guarantees of the track record. They run in about a second and
+the reproducibility guarantees of the LLM extractor, and the append-only
+guarantees of the track record. They run in about a second and
 need no data. Run them before trusting a number.
 
 ---
@@ -365,6 +367,45 @@ newsworthy in the first place; comparing `prediction_raw` against `prediction` o
 the *same* bet does not. If the adjustments are making predictions worse on
 average, it says so plainly — that is the finding, and it is the reason the two
 columns are stored separately.
+
+### Coach-revealed strategy (LLM, `R/09_llm_news.R`)
+
+```r
+source("R/09_llm_news.R")
+news <- news_before(fetch_news(50))     # look-ahead gate FIRST
+extract_strategy_signals(news)          # cached, schema-validated
+compare_extractors(news)                # rules vs model, side by side
+```
+
+This does **not** replace the pattern rules in `06`. Those answer "who is out",
+and they already do it well: ESPN tags articles with the same athlete IDs the box
+scores use, so entity resolution is exact and free, and injury-report prose is
+formulaic enough for ordered rules that stay fully auditable. In a live sample,
+17 of 20 articles came back athlete-tagged.
+
+The model is pointed at the residue regex cannot read — a coach saying he intends
+to cap a starter's minutes on the back end of a back-to-back, or that a rotation
+is changing. That is genuinely unstructured, and nobody sells it as a field.
+
+Three things make an LLM awkward in an auditable pipeline, and each is handled:
+
+- **Non-determinism.** Every extraction is cached by *(article id, prompt version,
+  model id)* into `data/llm_news_cache.jsonl`, which is **committed**. An article
+  already in the cache is never queried again, so a re-run cannot change a logged
+  extraction. The cache is the audit artifact.
+- **Look-ahead through the training cutoff.** A model may know how a game actually
+  turned out and answer from memory rather than from the text — something regex
+  cannot do. The prompt forbids outside knowledge and requires a verbatim quoted
+  sentence for every signal, and `extract_strategy_signals()` runs the
+  `news_before()` gate itself rather than trusting the caller. Running it over
+  historical articles to build a backtest is not supported.
+- **It might not help.** So it runs *beside* the rules, and `compare_extractors()`
+  reports where they disagree with the evidence sentences attached, so you can
+  judge who is right. That comparison is the evidence for whether the file earns
+  its place.
+
+No failure mode invents a signal: a refusal, a truncation, an unparseable body and
+an empty response all return zero signals rather than a guess.
 
 ### Usage model: who benefits when a player sits
 

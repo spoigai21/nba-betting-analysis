@@ -121,6 +121,66 @@ fetch_injuries <- function(rosters = fetch_rosters()) {
   flagged
 }
 
+# --- SportsDataIO: buying the structured answer -----------------------------
+# The roster-status approach above reconstructs availability from a field ESPN
+# may or may not populate. SportsDataIO sells it directly, with the designation
+# and a timestamp. Where a vendor sells the structured answer, buying it beats
+# extracting it -- which leaves the NLP work in 09 pointed only at the part
+# nobody sells, coach-revealed rotation intent.
+#
+# Returns the same shape as fetch_injuries(), so injuries_to_news() consumes it
+# unchanged and you still price the impact yourself.
+
+sdio_key <- function() {
+  key <- Sys.getenv(CFG$sportsdataio$key_env, "")
+  if (!nzchar(key))
+    stop("No ", CFG$sportsdataio$key_env, ". Free trial at https://sportsdata.io ",
+         "(1,000 calls/month), then put it in .env:\n",
+         "      SPORTSDATAIO_API_KEY=your_key_here", call. = FALSE)
+  key
+}
+
+fetch_sdio_injuries <- function(path = CFG$sportsdataio$injuries_path) {
+  if (!requireNamespace("httr2", quietly = TRUE)) {
+    warn('install.packages("httr2")'); return(tibble())
+  }
+  url <- paste0(CFG$sportsdataio$base, "/", path)
+  info("GET ", url)
+
+  resp <- tryCatch(
+    httr2::request(url) |>
+      httr2::req_headers(`Ocp-Apim-Subscription-Key` = sdio_key()) |>
+      httr2::req_timeout(60) |>
+      httr2::req_perform(),
+    error = function(e) e)
+
+  if (inherits(resp, "error")) {
+    warn("SportsDataIO request failed: ", conditionMessage(resp))
+    warn("If this is a 404, the endpoint path is wrong -- it is a placeholder. ",
+         "Check your account's API explorer and set CFG$sportsdataio$injuries_path.")
+    return(tibble())
+  }
+
+  raw <- httr2::resp_body_json(resp, simplifyVector = FALSE)
+  if (!length(raw)) { info("no injuries returned"); return(tibble()) }
+
+  # Field names are taken defensively: a vendor schema is not ours to assume.
+  pick <- function(x, ...) {
+    for (nm in c(...)) if (!is.null(x[[nm]])) return(as.character(x[[nm]]))
+    NA_character_
+  }
+  out <- map_dfr(raw, function(r) tibble(
+    team        = canonical_team(pick(r, "Team", "TeamAbbreviation")),
+    player      = pick(r, "Name", "PlayerName", "FirstName"),
+    status_name = pick(r, "Status", "InjuryStatus"),
+    body_part   = pick(r, "BodyPart", "InjuryBodyPart"),
+    updated     = pick(r, "Updated", "LastUpdated"),
+    source      = "sportsdataio"
+  ))
+  info(nrow(out), " injury row(s) from SportsDataIO")
+  out %>% filter(.data$team %in% TEAM_ALIASES$code)
+}
+
 # Automation finds WHO; you decide HOW MUCH. This turns flagged players into
 # manual_news.csv rows with the impact columns left blank, deliberately -- a
 # points estimate is a judgement call, and the project's whole stance is that

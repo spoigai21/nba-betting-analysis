@@ -453,6 +453,104 @@ m_ovr <- suppressMessages(detect_columns(clean_names(tibble(
 eq(m_ovr[["spread_close"]], "weird_line_name", "a config override beats the guesser")
 
 # ===========================================================================
+section("LLM strategy extraction -- reproducibility and the look-ahead gate")
+# ===========================================================================
+# A model call is not reproducible; a committed cache of its answers is. These
+# pin the properties that make an LLM admissible in an auditable pipeline at
+# all: the gate holds, a re-run makes no calls, a changed prompt re-queries,
+# and no failure mode ever invents a signal.
+
+suppressMessages(suppressWarnings(source("R/09_llm_news.R")))
+CFG$llm$cache <- file.path(tempdir(), "llm_test_cache.jsonl"); unlink(CFG$llm$cache)
+
+.n_calls <- 0L
+.stub <- function(body) {
+  .n_calls <<- .n_calls + 1L
+  txt <- if (grepl("minutes cap", body$messages[[1]]$content, fixed = TRUE))
+    paste0('{"signals":[{"player":"A Player","signal_type":"minutes_restriction",',
+           '"direction":"decrease","confidence":0.9,"evidence":"quoted sentence",',
+           '"attributed_to":"coach"}]}')
+  else '{"signals":[]}'
+  list(model = "claude-opus-5", stop_reason = "end_turn",
+       content = list(list(type = "text", text = txt)))
+}
+options(nba.llm_call = .stub)
+
+.news <- tibble(
+  article_id = c("t1", "t2"),
+  headline = c("minutes cap for A Player", "routine recap"),
+  description = c("Coach said A Player is on a minutes cap.", "Team won."),
+  published = as.POSIXct(c("2026-11-01 12:00:00", "2026-11-03 12:00:00"), tz = "UTC"),
+  url = c("u1", "u2"),
+  athlete_ids = list("1", "2"), athlete_names = list("A Player", "B Player"))
+
+# The request must actually carry the guards we think it does.
+.body <- llm_build_body(.news[1, ])
+eq(.body$output_config$format$type, "json_schema", "the request asks for schema-validated JSON")
+eq(.body$model, CFG$llm$model, "the configured model is the one sent")
+ok(!is.null(.body$system[[1]]$cache_control), "the stable system prefix is marked cacheable")
+ok(nchar(.body$system[[1]]$text) > 500, "the system prompt carries the binding rules")
+ok(grepl("ONLY the article text", .body$system[[1]]$text, fixed = TRUE),
+   "the prompt forbids answering from the model's own knowledge")
+ok(!inherits(try(jsonlite::toJSON(.body, auto_unbox = TRUE), silent = TRUE), "try-error"),
+   "the whole request body serialises to valid JSON")
+
+# The look-ahead gate: an article published after the cutoff is never sent.
+.n_calls <- 0L
+sig <- suppressMessages(
+  extract_strategy_signals(.news, cutoff = as.POSIXct("2026-11-02 00:00:00", tz = "UTC")))
+eq(.n_calls, 1L, "an article published after the cutoff is never sent to the model")
+eq(nrow(sig), 1L, "the signal from the in-window article is returned")
+eq(sig$signal_type, "minutes_restriction", "and carries its type")
+
+# Reproducibility: the same batch again must cost nothing and change nothing.
+.n_calls <- 0L
+sig2 <- suppressMessages(
+  extract_strategy_signals(.news, cutoff = as.POSIXct("2026-11-02 00:00:00", tz = "UTC")))
+eq(.n_calls, 0L, "a re-run is served entirely from cache")
+eq(sig2$evidence, sig$evidence, "and returns byte-identical extractions")
+
+# The prompt version is part of the cache key, so changing instructions
+# re-queries rather than silently mixing two prompts in one file.
+.saved <- LLM_PROMPT_VERSION
+LLM_PROMPT_VERSION <- "test-v2"
+.n_calls <- 0L
+invisible(suppressMessages(
+  extract_strategy_signals(.news, cutoff = as.POSIXct("2026-11-02 00:00:00", tz = "UTC"))))
+eq(.n_calls, 1L, "bumping the prompt version re-queries")
+LLM_PROMPT_VERSION <- .saved
+
+# No failure mode may fabricate a signal.
+for (case in list(
+  list(nm = "refusal",     r = list(stop_reason = "refusal", content = list())),
+  list(nm = "max_tokens",  r = list(stop_reason = "max_tokens",
+                                    content = list(list(type = "text", text = '{"signals":[')))),
+  list(nm = "unparseable", r = list(stop_reason = "end_turn",
+                                    content = list(list(type = "text", text = "sorry!")))),
+  list(nm = "empty",       r = list(stop_reason = "end_turn", content = list())))) {
+  p <- llm_parse_response(case$r)
+  ok(!p$ok && length(p$signals) == 0,
+     paste0("a ", case$nm, " response yields no signals, not a guess"))
+}
+ok(llm_parse_response(list(stop_reason = "end_turn",
+     content = list(list(type = "text", text = '{"signals":[]}'))))$ok,
+   "a well-formed empty result is a success, not a failure")
+
+# The cache is a readable audit artifact, not an opaque blob.
+.recs <- llm_cache_read(CFG$llm$cache)
+ok(length(.recs) >= 1, "the cache round-trips through NDJSON")
+.one <- .recs[[1]]
+ok(all(c("article_id","model","prompt_version","extracted_at","signals") %in% names(.one)),
+   "each cached record carries full provenance")
+eq(llm_cache_key("a", "v", "m"), "a|v|m", "the cache key is article, prompt version and model")
+
+eq(nrow(strategy_signals_actionable(sig, 0.95)), 0L,
+   "the confidence floor excludes signals below it")
+eq(nrow(strategy_signals_actionable(sig, 0.5)), 1L, "and keeps those above it")
+options(nba.llm_call = NULL)
+unlink(CFG$llm$cache)
+
+# ===========================================================================
 section("Magnitude-plus-favourite spreads")
 # ===========================================================================
 # The most dangerous shape a betting file takes: the spread stored as a
