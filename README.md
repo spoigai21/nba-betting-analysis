@@ -96,7 +96,7 @@ nba-market-model/
 Rscript tests/run_tests.R
 ```
 
-199 checks over the arithmetic that would be invisible if it were wrong: odds
+207 checks over the arithmetic that would be invisible if it were wrong: odds
 conversion, settlement sign conventions, CLV signs, the no-look-ahead property
 of the rolling features, column detection against real-world header shapes,
 best-price selection across books, magnitude-plus-favourite spread rebuilding,
@@ -376,6 +376,11 @@ news <- news_before(fetch_news(50))     # look-ahead gate FIRST
 extract_strategy_signals(news)          # cached, schema-validated
 compare_extractors(news)                # rules vs model, side by side
 ```
+
+Provider is a one-line switch in `config.R` — `"gemini"` (default) or
+`"anthropic"`. Everything around the call is provider-agnostic, so the October
+rules-vs-model comparison can be run either way. Gemini's free tier is 1,500
+requests/day against a need of ~50, so this costs nothing to run.
 
 This does **not** replace the pattern rules in `06`. Those answer "who is out",
 and they already do it well: ESPN tags articles with the same athlete IDs the box

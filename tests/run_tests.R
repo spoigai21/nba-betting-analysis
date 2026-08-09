@@ -466,13 +466,22 @@ CFG$llm$cache <- file.path(tempdir(), "llm_test_cache.jsonl"); unlink(CFG$llm$ca
 .n_calls <- 0L
 .stub <- function(body) {
   .n_calls <<- .n_calls + 1L
-  txt <- if (grepl("minutes cap", body$messages[[1]]$content, fixed = TRUE))
+  # Read the user text out of whichever wire shape is active.
+  usr <- if (identical(llm_provider(), "gemini")) body$contents[[1]]$parts[[1]]$text
+         else body$messages[[1]]$content
+  txt <- if (grepl("minutes cap", usr, fixed = TRUE))
     paste0('{"signals":[{"player":"A Player","signal_type":"minutes_restriction",',
            '"direction":"decrease","confidence":0.9,"evidence":"quoted sentence",',
            '"attributed_to":"coach"}]}')
   else '{"signals":[]}'
-  list(model = "claude-opus-5", stop_reason = "end_turn",
-       content = list(list(type = "text", text = txt)))
+  # Return whichever wire shape the active provider expects.
+  if (identical(llm_provider(), "gemini"))
+    list(candidates = list(list(finishReason = "STOP",
+                                content = list(role = "model",
+                                               parts = list(list(text = txt))))))
+  else
+    list(model = "claude-opus-5", stop_reason = "end_turn",
+         content = list(list(type = "text", text = txt)))
 }
 options(nba.llm_call = .stub)
 
@@ -485,15 +494,36 @@ options(nba.llm_call = .stub)
   athlete_ids = list("1", "2"), athlete_names = list("A Player", "B Player"))
 
 # The request must actually carry the guards we think it does.
-.body <- llm_build_body(.news[1, ])
-eq(.body$output_config$format$type, "json_schema", "the request asks for schema-validated JSON")
-eq(.body$model, CFG$llm$model, "the configured model is the one sent")
-ok(!is.null(.body$system[[1]]$cache_control), "the stable system prefix is marked cacheable")
-ok(nchar(.body$system[[1]]$text) > 500, "the system prompt carries the binding rules")
-ok(grepl("ONLY the article text", .body$system[[1]]$text, fixed = TRUE),
+.gb <- gemini_body(.news[1, ])
+eq(.gb$generationConfig$responseMimeType, "application/json",
+   "gemini: the request asks for JSON back")
+ok(nchar(.gb$systemInstruction$parts[[1]]$text) > 500,
+   "gemini: the system instruction carries the binding rules")
+ok(grepl("ONLY the article text", .gb$systemInstruction$parts[[1]]$text, fixed = TRUE),
    "the prompt forbids answering from the model's own knowledge")
-ok(!inherits(try(jsonlite::toJSON(.body, auto_unbox = TRUE), silent = TRUE), "try-error"),
-   "the whole request body serialises to valid JSON")
+ok(!inherits(try(jsonlite::toJSON(.gb, auto_unbox = TRUE), silent = TRUE), "try-error"),
+   "gemini: the whole request body serialises to valid JSON")
+
+# Gemini takes an OpenAPI subset, not full JSON Schema. Getting this wrong
+# strips the constraints silently and leaves a request that validates nothing.
+.gs <- gemini_schema(llm_news_schema())
+eq(.gs$type, "OBJECT", "gemini schema: types are uppercased")
+eq(.gs$properties$signals$type, "ARRAY", "gemini schema: nested types too")
+ok(is.null(.gs$additionalProperties), "gemini schema: additionalProperties is dropped")
+eq(length(.gs$properties$signals$items$properties$signal_type$enum), length(SIGNAL_TYPES),
+   "gemini schema: enum values survive the conversion")
+eq(length(.gs$properties$signals$items$required), 6L,
+   "gemini schema: required field names survive the conversion")
+eq(unlist(.gs$required), "signals", "gemini schema: top-level required survives")
+
+# The Anthropic path must still build correctly, so the provider switch is real.
+.saved_prov <- CFG$llm$provider
+CFG$llm$provider <- "anthropic"
+.ab <- llm_build_body(.news[1, ])
+eq(.ab$output_config$format$type, "json_schema", "anthropic: schema-validated JSON")
+eq(.ab$model, CFG$llm$anthropic$model, "anthropic: the configured model is sent")
+ok(!is.null(.ab$system[[1]]$cache_control), "anthropic: stable prefix marked cacheable")
+CFG$llm$provider <- .saved_prov
 
 # The look-ahead gate: an article published after the cutoff is never sent.
 .n_calls <- 0L
@@ -521,19 +551,20 @@ eq(.n_calls, 1L, "bumping the prompt version re-queries")
 LLM_PROMPT_VERSION <- .saved
 
 # No failure mode may fabricate a signal.
+.gcand <- function(txt, fin = "STOP")
+  list(candidates = list(list(finishReason = fin,
+       content = list(role = "model", parts = list(list(text = txt))))))
 for (case in list(
-  list(nm = "refusal",     r = list(stop_reason = "refusal", content = list())),
-  list(nm = "max_tokens",  r = list(stop_reason = "max_tokens",
-                                    content = list(list(type = "text", text = '{"signals":[')))),
-  list(nm = "unparseable", r = list(stop_reason = "end_turn",
-                                    content = list(list(type = "text", text = "sorry!")))),
-  list(nm = "empty",       r = list(stop_reason = "end_turn", content = list())))) {
+  list(nm = "safety-blocked", r = list(promptFeedback = list(blockReason = "SAFETY"))),
+  list(nm = "truncated",      r = .gcand('{"signals":[', "MAX_TOKENS")),
+  list(nm = "unparseable",    r = .gcand("sorry!")),
+  list(nm = "empty",          r = list(candidates = list())),
+  list(nm = "recitation",     r = .gcand("x", "RECITATION")))) {
   p <- llm_parse_response(case$r)
   ok(!p$ok && length(p$signals) == 0,
-     paste0("a ", case$nm, " response yields no signals, not a guess"))
+     paste0("gemini: a ", case$nm, " response yields no signals, not a guess"))
 }
-ok(llm_parse_response(list(stop_reason = "end_turn",
-     content = list(list(type = "text", text = '{"signals":[]}'))))$ok,
+ok(llm_parse_response(.gcand('{"signals":[]}'))$ok,
    "a well-formed empty result is a success, not a failure")
 
 # The cache is a readable audit artifact, not an opaque blob.
@@ -547,6 +578,26 @@ eq(llm_cache_key("a", "v", "m"), "a|v|m", "the cache key is article, prompt vers
 eq(nrow(strategy_signals_actionable(sig, 0.95)), 0L,
    "the confidence floor excludes signals below it")
 eq(nrow(strategy_signals_actionable(sig, 0.5)), 1L, "and keeps those above it")
+
+# One sentence can carry two signal types legitimately ("held to 28 minutes AND
+# will not play back-to-backs"). The model is right to report both, but summing
+# them downstream would double-count one piece of information about one player.
+.dup <- tibble(article_id = "x", player = rep("A Player", 2),
+               signal_type = c("minutes_restriction", "load_management"),
+               direction = "decrease", confidence = c(1.0, 0.95),
+               evidence = "same sentence", attributed_to = "coach",
+               headline = "h", published = "p", model = "m",
+               prompt_version = "v", extracted_at = "t")
+.act <- strategy_signals_actionable(.dup)
+eq(nrow(.act), 1L, "two signal types for one player collapse to one actionable row")
+eq(.act$signal_type, "minutes_restriction", "the most confident type is kept")
+eq(.act$also, "load_management", "and the folded-in type is recorded, not discarded")
+eq(.act$n_raw, 2L, "with a count of what was collapsed")
+
+# Opposite directions are genuinely different claims and must NOT be merged.
+.opp <- .dup; .opp$direction <- c("decrease", "increase")
+eq(nrow(strategy_signals_actionable(.opp)), 2L,
+   "opposing directions stay separate rows")
 options(nba.llm_call = NULL)
 unlink(CFG$llm$cache)
 

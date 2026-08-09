@@ -132,24 +132,114 @@ llm_user_content <- function(article) {
 # ===========================================================================
 # 2. The call
 # ===========================================================================
-# Swappable via options(nba.llm_call = ...) so the surrounding machinery --
-# caching, parsing, comparison -- is testable without a network or a key.
+# Two providers behind one interface. Everything else in this file -- the
+# cache, the look-ahead gate, the schema, the failure handling, the comparison
+# against the rules -- is provider-agnostic, so switching is CFG$llm$provider
+# and nothing else.
+#
+# The whole call is swappable via options(nba.llm_call = ...), which is how the
+# test suite exercises this machinery without a network or a key.
+
+llm_provider <- function() CFG$llm$provider
+llm_cfg      <- function() CFG$llm[[llm_provider()]]
+llm_model    <- function() llm_cfg()$model
 
 llm_api_key <- function() {
-  key <- Sys.getenv(CFG$llm$api_key_env, "")
+  env <- llm_cfg()$key_env
+  key <- Sys.getenv(env, "")
   if (!nzchar(key))
-    stop("No ", CFG$llm$api_key_env, ". Put it in .env at the project root:\n",
-         "      ANTHROPIC_API_KEY=sk-ant-...\n",
+    stop("No ", env, " for provider '", llm_provider(), "'. Put it in .env:\n",
+         "      ", env, "=your_key_here\n",
          "  (.env is gitignored.)", call. = FALSE)
   key
 }
 
-default_llm_call <- function(body) {
-  if (!requireNamespace("httr2", quietly = TRUE))
-    stop('install.packages("httr2")', call. = FALSE)
-  resp <- httr2::request(CFG$llm$base) |>
+# --- Gemini ----------------------------------------------------------------
+# generateContent takes an OpenAPI-3.0 subset for responseSchema, not full JSON
+# Schema: types are UPPERCASE and additionalProperties is not supported. If a
+# future API version rejects this, the error surfaces verbatim -- it is not
+# swallowed -- and lowercase types are the first thing to try.
+gemini_schema <- function(sch) {
+  if (!is.list(sch)) return(sch)
+  # An UNNAMED list is a JSON array -- `enum` values, `required` field names,
+  # and so on. Walking it as though it were an object silently returns an empty
+  # list, which strips exactly the constraints the schema exists to impose and
+  # leaves a request that looks fine and validates nothing.
+  if (is.null(names(sch)) || all(names(sch) == ""))
+    return(lapply(sch, gemini_schema))
+  out <- list()
+  for (nm in names(sch)) {
+    v <- sch[[nm]]
+    if (identical(nm, "additionalProperties")) next          # unsupported
+    if (identical(nm, "type") && is.character(v)) { out[[nm]] <- toupper(v); next }
+    out[[nm]] <- if (is.list(v)) gemini_schema(v) else v
+  }
+  out
+}
+
+gemini_body <- function(article) {
+  list(
+    systemInstruction = list(parts = list(list(text = llm_system_prompt()))),
+    contents = list(list(role = "user",
+                         parts = list(list(text = llm_user_content(article))))),
+    generationConfig = list(
+      responseMimeType = "application/json",
+      responseSchema   = gemini_schema(llm_news_schema()),
+      maxOutputTokens  = CFG$llm$max_tokens
+    )
+  )
+}
+
+gemini_perform <- function(body) {
+  url <- paste0(CFG$llm$gemini$base, "/models/", llm_model(), ":generateContent")
+  resp <- httr2::request(url) |>
+    httr2::req_headers(`x-goog-api-key` = llm_api_key(),
+                       `content-type`   = "application/json") |>
+    httr2::req_body_json(body, auto_unbox = TRUE) |>
+    httr2::req_retry(max_tries = 3) |>
+    httr2::req_timeout(120) |>
+    httr2::req_perform()
+  httr2::resp_body_json(resp, simplifyVector = FALSE)
+}
+
+gemini_extract_text <- function(resp) {
+  # A prompt blocked before generation carries no candidate at all.
+  if (!is.null(resp$promptFeedback$blockReason))
+    return(list(reason = paste0("blocked:", resp$promptFeedback$blockReason), text = NULL))
+  cands <- resp$candidates %||% list()
+  if (!length(cands)) return(list(reason = "empty", text = NULL))
+  cand <- cands[[1]]
+  fin <- cand$finishReason %||% "STOP"
+  if (!fin %in% c("STOP", "MAX_TOKENS"))
+    return(list(reason = paste0("finish:", fin), text = NULL))
+  if (identical(fin, "MAX_TOKENS")) return(list(reason = "max_tokens", text = NULL))
+  parts <- cand$content$parts %||% list()
+  txt <- paste0(vapply(parts, function(p) p$text %||% "", character(1)), collapse = "")
+  if (!nzchar(txt)) return(list(reason = "empty", text = NULL))
+  list(reason = "ok", text = txt)
+}
+
+# --- Anthropic --------------------------------------------------------------
+anthropic_body <- function(article) {
+  list(
+    model = llm_model(),
+    max_tokens = CFG$llm$max_tokens,
+    # The system prompt is identical on every article, so it is the stable
+    # cache prefix. NOTE: it must clear the model's minimum cacheable prefix or
+    # the marker is silently inert -- verify with count_tokens.
+    system = list(list(type = "text", text = llm_system_prompt(),
+                       cache_control = list(type = "ephemeral"))),
+    output_config = list(effort = CFG$llm$anthropic$effort,
+                         format = list(type = "json_schema",
+                                       schema = llm_news_schema())),
+    messages = list(list(role = "user", content = llm_user_content(article)))
+  )
+}
+
+anthropic_perform <- function(body) {
+  resp <- httr2::request(CFG$llm$anthropic$base) |>
     httr2::req_headers(`x-api-key` = llm_api_key(),
-                       `anthropic-version` = CFG$llm$version,
+                       `anthropic-version` = CFG$llm$anthropic$version,
                        `content-type` = "application/json") |>
     httr2::req_body_json(body, auto_unbox = TRUE) |>
     httr2::req_retry(max_tries = 3) |>
@@ -158,45 +248,54 @@ default_llm_call <- function(body) {
   httr2::resp_body_json(resp, simplifyVector = FALSE)
 }
 
-llm_call <- function(body) (getOption("nba.llm_call", default_llm_call))(body)
-
-llm_build_body <- function(article) {
-  list(
-    model = CFG$llm$model,
-    max_tokens = CFG$llm$max_tokens,
-    # The system prompt and schema are identical on every article, so they are
-    # the stable cache prefix; the article itself is the only thing that varies.
-    system = list(list(type = "text", text = llm_system_prompt(),
-                       cache_control = list(type = "ephemeral"))),
-    output_config = list(effort = CFG$llm$effort,
-                         format = list(type = "json_schema",
-                                       schema = llm_news_schema())),
-    messages = list(list(role = "user", content = llm_user_content(article)))
-  )
-}
-
-# Pull the signals out of a response, refusing to guess when the model did not
-# actually finish.
-llm_parse_response <- function(resp) {
-  stop_reason <- resp$stop_reason %||% NA_character_
-  if (identical(stop_reason, "refusal"))
-    return(list(ok = FALSE, reason = "refusal", signals = list()))
-  if (identical(stop_reason, "max_tokens"))
-    return(list(ok = FALSE, reason = "max_tokens", signals = list()))
-
+anthropic_extract_text <- function(resp) {
+  sr <- resp$stop_reason %||% NA_character_
+  if (identical(sr, "refusal"))    return(list(reason = "refusal", text = NULL))
+  if (identical(sr, "max_tokens")) return(list(reason = "max_tokens", text = NULL))
   txt <- NULL
   for (b in resp$content %||% list())
     if (identical(b$type, "text")) { txt <- b$text; break }
-  if (is.null(txt) || !nzchar(txt))
-    return(list(ok = FALSE, reason = "empty", signals = list()))
+  if (is.null(txt) || !nzchar(txt)) return(list(reason = "empty", text = NULL))
+  list(reason = "ok", text = txt)
+}
 
-  parsed <- tryCatch(jsonlite::fromJSON(txt, simplifyVector = FALSE),
+# --- dispatch ---------------------------------------------------------------
+llm_build_body <- function(article) {
+  switch(llm_provider(),
+         gemini    = gemini_body(article),
+         anthropic = anthropic_body(article),
+         stop("unknown provider '", llm_provider(), "'", call. = FALSE))
+}
+
+default_llm_call <- function(body) {
+  if (!requireNamespace("httr2", quietly = TRUE))
+    stop('install.packages("httr2")', call. = FALSE)
+  switch(llm_provider(),
+         gemini    = gemini_perform(body),
+         anthropic = anthropic_perform(body),
+         stop("unknown provider '", llm_provider(), "'", call. = FALSE))
+}
+
+llm_call <- function(body) (getOption("nba.llm_call", default_llm_call))(body)
+
+# Pull the signals out of a response, refusing to guess when the model did not
+# actually finish. A truncated, blocked or unparseable answer yields zero
+# signals -- never a partial one, which would be indistinguishable from a real
+# empty result once it reached the cache.
+llm_parse_response <- function(resp) {
+  got <- switch(llm_provider(),
+                gemini    = gemini_extract_text(resp),
+                anthropic = anthropic_extract_text(resp),
+                list(reason = "unknown_provider", text = NULL))
+  if (is.null(got$text))
+    return(list(ok = FALSE, reason = got$reason, signals = list()))
+
+  parsed <- tryCatch(jsonlite::fromJSON(got$text, simplifyVector = FALSE),
                      error = function(e) NULL)
   if (is.null(parsed) || is.null(parsed$signals))
     return(list(ok = FALSE, reason = "unparseable", signals = list()))
 
-  list(ok = TRUE, reason = "ok", signals = parsed$signals,
-       model = resp$model %||% CFG$llm$model)
+  list(ok = TRUE, reason = "ok", signals = parsed$signals, model = llm_model())
 }
 
 # ===========================================================================
@@ -208,7 +307,7 @@ llm_parse_response <- function(resp) {
 # like a logged prediction.
 
 llm_cache_key <- function(article_id, prompt_version = LLM_PROMPT_VERSION,
-                          model = CFG$llm$model) {
+                          model = llm_model()) {
   paste(article_id, prompt_version, model, sep = "|")
 }
 
@@ -328,8 +427,35 @@ extract_strategy_signals <- function(news, cutoff = Sys.time(),
 # Actionable subset, and a reminder that this is a forward-test-only signal.
 strategy_signals_actionable <- function(sig, min_confidence = CFG$llm$min_confidence) {
   if (!NROW(sig)) return(sig)
-  sig %>% filter(.data$confidence >= min_confidence,
-                 .data$direction %in% c("increase", "decrease"))
+  out <- sig %>% filter(.data$confidence >= min_confidence,
+                        .data$direction %in% c("increase", "decrease"))
+  if (!nrow(out)) return(out)
+
+  # One sentence can legitimately carry two signal types -- "held to 28 minutes
+  # and will not play both ends of back-to-backs" is a minutes_restriction AND
+  # load_management, and the model is right to report both. But they are one
+  # piece of information about one player, so anything downstream that summed
+  # them would double-count it. Collapse to one row per player per direction,
+  # keeping the most confident, and record what was folded in.
+  out %>%
+    group_by(.data$player, .data$direction) %>%
+    arrange(desc(.data$confidence), .by_group = TRUE) %>%
+    summarise(
+      # `also` MUST be computed before signal_type is reassigned: summarise()
+      # evaluates in order and later expressions see the columns earlier ones
+      # created, so reading .data$signal_type after overwriting it would give
+      # the new scalar rather than the group's values -- and silently yield "".
+      also = paste(setdiff(unique(.data$signal_type), first(.data$signal_type)),
+                   collapse = ", "),
+      signal_type = first(.data$signal_type),
+      confidence = first(.data$confidence),
+      evidence = first(.data$evidence),
+      attributed_to = first(.data$attributed_to),
+      article_id = first(.data$article_id),
+      headline = first(.data$headline),
+      n_raw = n(),
+      .groups = "drop") %>%
+    arrange(desc(.data$confidence))
 }
 
 # ===========================================================================
@@ -380,7 +506,7 @@ compare_extractors <- function(news, cutoff = Sys.time(), gazetteer = NULL) {
 }
 
 # ---------------------------------------------------------------------------
-step("09_llm_news.R loaded")
+step("09_llm_news.R loaded  [provider: ", CFG$llm$provider, " / ", llm_model(), "]")
 info("news <- news_before(fetch_news(50))    look-ahead gate FIRST")
 info("extract_strategy_signals(news)         cached, schema-validated")
 info("strategy_signals_actionable(sig)       above the confidence floor")

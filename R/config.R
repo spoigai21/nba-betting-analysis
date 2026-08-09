@@ -160,11 +160,40 @@ CFG <- list(
   # model is pointed at the part regex cannot do: coach-revealed rotation and
   # minutes intentions.
   llm = list(
-    model    = "claude-opus-5",
-    effort   = "low",          # extraction from one short article
-    api_key_env = "ANTHROPIC_API_KEY",
-    base     = "https://api.anthropic.com/v1/messages",
-    version  = "2023-06-01",
+    # "gemini" or "anthropic". Everything around the call -- the cache, the
+    # look-ahead gate, the schema, the failure handling, the comparison against
+    # the rules -- is provider-agnostic, so this is a one-line switch and the
+    # October rules-vs-model comparison can be run either way.
+    provider = "gemini",
+
+    # Free tier: 1,500 requests/day, 15/minute, no card. At ~50 articles a day
+    # that is 3% of the quota. Note free-tier content may be used by Google to
+    # improve their products -- fine here, since the input is public ESPN news
+    # and no prediction of ours is ever sent.
+    gemini = list(
+      # PIN AN EXPLICIT VERSION -- never an alias like "gemini-flash-latest".
+      # The cache key is (article, prompt version, model id). An alias whose
+      # underlying model changes would keep the same key, so old extractions
+      # would be served under a name that now means something else and new
+      # ones would silently mix two models in one file. Pinning is what makes
+      # the cache mean anything.
+      #
+      # Verified working on 2026-08-09. Note that a model appearing in
+      # /v1beta/models does NOT imply your key can call it: gemini-2.5-flash
+      # lists fine and returns 404 "no longer available to new users".
+      model   = "gemini-3.5-flash-lite",
+      base    = "https://generativelanguage.googleapis.com/v1beta",
+      key_env = "GEMINI_API_KEY"
+    ),
+
+    anthropic = list(
+      model   = "claude-opus-5",
+      base    = "https://api.anthropic.com/v1/messages",
+      version = "2023-06-01",
+      effort  = "low",              # extraction from one short article
+      key_env = "ANTHROPIC_API_KEY"
+    ),
+
     max_tokens = 4000,
 
     # Every extraction is cached by (article, prompt version, model) and the
