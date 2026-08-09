@@ -95,11 +95,11 @@ nba-market-model/
 Rscript tests/run_tests.R
 ```
 
-164 checks over the arithmetic that would be invisible if it were wrong: odds
+177 checks over the arithmetic that would be invisible if it were wrong: odds
 conversion, settlement sign conventions, CLV signs, the no-look-ahead property
 of the rolling features, column detection against real-world header shapes,
-best-price selection across books, and the append-only guarantees of the track
-record. They run in about a second and
+best-price selection across books, magnitude-plus-favourite spread rebuilding,
+and the append-only guarantees of the track record. They run in about a second and
 need no data. Run them before trusting a number.
 
 ---
@@ -271,6 +271,15 @@ column_overrides = list(spread_close = "home_line_close", total_close = "ou")
 
 It also checks the spread's sign against actual results and flips it if the file quotes
 the away side — the kind of silent error that otherwise invalidates a whole backtest.
+
+A nastier variant gets first-class handling: many public files store the spread as
+a positive **magnitude** and name the favourite in a separate column
+(`whos_favored`). Read naively, every away-favourite game comes out inverted, and
+a blanket sign flip cannot repair it — on a real 24,000-game file the raw
+correlation with margin is +0.21, flipping the column moves it to −0.21, which is
+wrong but close enough to the expected −0.45 to pass unchallenged. The loader
+detects the favourite column, rebuilds a signed home-side line from it, and
+**refuses to continue** if it finds a single-signed spread it cannot resolve.
 
 ### Forward-testing
 

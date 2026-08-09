@@ -514,6 +514,22 @@ if (a$n < CFG$backtest$min_bets_for_conclusion) {
           "   does, because it is measured against a number rather than a coin flip.\n",
           "   Verdict: promising, unproven. Keep the rules fixed and collect more.")
 
+} else if (a$roi_hi < 0) {
+  # Not merely unproven -- reliably losing. Worth saying plainly, and worth
+  # comparing against the placebo: a strategy that loses at the same rate as
+  # betting at random has no information in it at all, as opposed to having
+  # information too small to overcome the vig.
+  like_placebo <- !is.na(pl[["lower"]]) && a$roi >= pl[["lower"]] && a$roi <= pl[["upper"]]
+  message("   No edge, and the interval [", roi_ci, "] sits entirely BELOW zero:\n",
+          "   this strategy loses reliably, not inconclusively.\n",
+          if (like_placebo)
+            paste0("   Its ROI also falls inside the placebo range (",
+                   sprintf("%+.2f%% to %+.2f%%", 100 * pl[["lower"]], 100 * pl[["upper"]]),
+                   "), so it is\n   indistinguishable from picking a side at random and paying the vig.\n")
+          else "",
+          "   That is a real finding, not a failure. It says the model is not\n",
+          "   adding information the market lacks -- see the encompassing test in\n",
+          "   08_diagnostics.R, which measures that directly.")
 } else {
   message("   No demonstrated edge. The ROI interval [", roi_ci, "] includes zero",
           if (have_clv) sprintf(",\n   and CLV is neutral (beat the close %.0f%% of the time).",

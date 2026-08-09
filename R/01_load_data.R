@@ -73,6 +73,18 @@ FIELD_SPECS <- list(
     avoid   = c("home", "spread", "line", "open", "close", "half")
   ),
 
+  # Which side was favoured. Only present in files that store the spread as a
+  # positive magnitude; see rebuild_home_spread() for why that matters.
+  favourite = list(
+    exact   = c("whos_favored", "whos_favoured", "who_favored", "who_favoured",
+                "favorite", "favourite", "favored", "favoured", "fav",
+                "favorite_team", "favourite_team", "team_favored"),
+    require = list(c("favored"), c("favoured"), c("favorite"), c("favourite"),
+                   c("fav")),
+    # A "spread_favorite" column is a NUMBER, not a side -- keep it out of here.
+    avoid   = c("spread", "line", "odds", "price", "points", "handicap", "cover")
+  ),
+
   # --- opening market (matched BEFORE closing, so "open" names are claimed) ---
   spread_open = list(
     exact   = c("spread_open", "open_spread", "opening_spread", "home_spread_open",
@@ -285,6 +297,71 @@ parse_number <- function(x) {
   suppressWarnings(as.numeric(chr))
 }
 
+# ===========================================================================
+# 2b. Magnitude-plus-favourite spreads
+# ===========================================================================
+# A large share of public datasets do not store a signed home-side spread at
+# all. They store the SIZE of the spread as a positive number and name the
+# favourite in a separate column. Read naively, every game where the away side
+# was favoured comes out with the wrong sign.
+#
+# This is the single most dangerous shape a betting file can take, because the
+# blanket sign-flip in validate_games() cannot repair it and does not notice.
+# On a real 24,000-game file the raw correlation with margin is about +0.21;
+# flipping the whole column moves it to -0.21, which is wrong but looks close
+# enough to the expected -0.45 to pass unchallenged -- leaving a third of the
+# dataset inverted, and every spread backtest built on it meaningless.
+
+# Which side was favoured, as a logical. Accepts a side label ("home"/"away",
+# "H"/"V") or the favoured team's own name.
+resolve_favourite_home <- function(fav, home_team, away_team) {
+  f <- tolower(trimws(as.character(fav)))
+  is_home <- rep(NA, length(f))
+  is_home[f %in% c("home", "h", "1", "true", "t")]                     <- TRUE
+  is_home[f %in% c("away", "a", "v", "visitor", "road", "0", "false", "f")] <- FALSE
+
+  idx <- which(is.na(is_home) & !is.na(f) & nzchar(f))
+  if (length(idx)) {
+    ft <- canonical_team(f[idx])
+    # A value matching neither side is not a favourite label -- leave it NA
+    # rather than guessing a direction.
+    is_home[idx] <- ifelse(ft == home_team[idx], TRUE,
+                    ifelse(ft == away_team[idx], FALSE, NA))
+  }
+  is_home
+}
+
+rebuild_home_spread <- function(spread, fav, home_team, away_team) {
+  is_home_fav <- resolve_favourite_home(fav, home_team, away_team)
+  mag <- abs(spread)
+  ifelse(is.na(is_home_fav) | is.na(mag), NA_real_,
+         ifelse(is_home_fav, -mag, mag))
+}
+
+# Rebuild any spread column that is a magnitude rather than a signed line.
+# A genuine home-side spread takes BOTH signs across a season; one that never
+# changes sign is a magnitude, whatever its header says.
+apply_favourite_orientation <- function(g) {
+  if (!".fav" %in% names(g) || all(is.na(g$.fav))) return(g)
+
+  for (col in c("spread_close", "spread_open")) {
+    v <- g[[col]]
+    if (all(is.na(v))) next
+    if (any(v < 0, na.rm = TRUE) && any(v > 0, na.rm = TRUE)) next  # already signed
+
+    rebuilt <- rebuild_home_spread(v, g$.fav, g$home_team, g$away_team)
+    resolved <- sum(!is.na(rebuilt))
+    had      <- sum(!is.na(v))
+    info(col, ": rebuilt from a magnitude plus a favourite column (",
+         resolved, " of ", had, " rows resolved)")
+    if (resolved < 0.95 * had)
+      warn("only ", scales::percent(resolved / had, 0.1), " of ", col,
+           " rows resolved -- check the favourite column's values")
+    g[[col]] <- rebuilt
+  }
+  g
+}
+
 # --- long ("one row per team") -> wide ("one row per game") ------------------
 # Some datasets store two rows per game with a home/away flag. Detect that and
 # pivot before mapping.
@@ -365,7 +442,12 @@ build_games <- function(df, map) {
     price_spread_home = pull_num("price_spread_home"),
     price_spread_away = pull_num("price_spread_away"),
     price_over        = pull_num("price_over"),
-    price_under       = pull_num("price_under")
+    price_under       = pull_num("price_under"),
+
+    # Carried alongside so the spread can be re-oriented once the teams are
+    # canonical; dropped by the explicit select() at the end.
+    .fav = if (is.na(map[["favourite"]])) NA_character_
+           else as.character(df[[map[["favourite"]]]])
   )
 
   g$season <- if (!is.na(map[["season"]])) {
@@ -380,6 +462,7 @@ build_games <- function(df, map) {
 
   g %>%
     filter(!is.na(.data$date), !is.na(.data$home_team), !is.na(.data$away_team)) %>%
+    apply_favourite_orientation() %>%
     mutate(
       total_points = .data$home_score + .data$away_score,
       margin       = .data$home_score - .data$away_score,
@@ -448,6 +531,22 @@ validate_games <- function(g) {
   # favoured (spread -6) goes with home winning (margin +8). A positive
   # correlation means the file quotes the away/favourite side.
   if (sum(!is.na(played$spread_close) & !is.na(played$margin)) > 30) {
+    v <- played$spread_close[!is.na(played$spread_close)]
+
+    # A genuine home-side spread takes both signs. One that never changes sign
+    # is a magnitude, and betting it as though it were a signed line inverts
+    # every game where the away side was favoured. Refuse rather than warn:
+    # the blanket flip below would land on a correlation that looks close
+    # enough to pass, which is how this mistake survives to the results table.
+    if (length(v) > 100 && (all(v >= 0) || all(v <= 0)))
+      stop("The spread column never changes sign (", sum(v >= 0), " of ", length(v),
+           " non-negative). That is a MAGNITUDE, not a home-side spread: the file\n",
+           "  records how big the spread is and names the favourite separately.\n",
+           "  Point the loader at that column in R/config.R:\n",
+           "      column_overrides = list(favourite = \"whos_favored\")\n",
+           "  Sign is rebuilt automatically once the favourite column is found.",
+           call. = FALSE)
+
     r <- cor(played$spread_close, played$margin, use = "complete.obs")
     info("cor(spread_close, margin) = ", round(r, 3),
          " (expect roughly -0.45: spread sd ~6 against margin sd ~13)")
@@ -456,14 +555,19 @@ validate_games <- function(g) {
         warn("spread appears to be quoted from the AWAY side -- flipping sign")
         g$spread_close <- -g$spread_close
         g$spread_open  <- -g$spread_open
+        # Re-check. A blanket flip only repairs a uniformly inverted column; if
+        # the sign varies row by row it will land somewhere plausible-looking
+        # and wrong, so say so rather than let it pass.
+        r2 <- cor(-played$spread_close, played$margin, use = "complete.obs")
+        info("after flipping, cor = ", round(r2, 3))
+        if (r2 > -0.2)
+          warn("still not the expected ~-0.45 after flipping. The sign probably ",
+               "varies row by row, which a blanket flip cannot repair. Do not ",
+               "trust any spread result from this file until it is understood.")
       } else {
         warn("spread sign looks inverted, but auto_fix_spread_sign is FALSE")
       }
     }
-    if (all(played$spread_close <= 0, na.rm = TRUE))
-      warn("every spread is <= 0. This file probably stores the FAVOURITE's spread ",
-           "plus a separate 'favourite' column; you will need to rebuild the home ",
-           "spread by hand before the backtest is meaningful.")
   }
 
   # -- totals --------------------------------------------------------------

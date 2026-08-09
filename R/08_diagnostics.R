@@ -231,14 +231,23 @@ calibration_report <- function(d) {
   }
 
   if (have_ml) {
-    m_mae <- mean(abs(dd$pred_home_win_prob - dd$home_win))
-    k_mae <- mean(abs(dd$p_market - dd$home_win))
-    info("mean |error|: model ", sprintf("%.4f", m_mae),
-         " vs market ", sprintf("%.4f", k_mae),
-         if (k_mae < m_mae) "  -- the market is the more accurate estimator, which is why ml_shrink_to_market < 1"
-         else "  -- the model is more accurate here; re-check for leakage before believing it")
-    info("RMS disagreement between them: ",
-         sprintf("%.4f", sqrt(mean((dd$pred_home_win_prob - dd$p_market)^2))))
+    # Compare like with like: a real file can be missing a fifth of its
+    # moneylines, and averaging the model over games the market never priced
+    # would not be a comparison at all. (Skipping this is also how the report
+    # ends up dividing by an NA and stopping the whole pipeline.)
+    kp <- !is.na(dd$p_market) & !is.na(dd$pred_home_win_prob) & !is.na(dd$home_win)
+    if (sum(kp) > 30) {
+      m_mae <- mean(abs(dd$pred_home_win_prob[kp] - dd$home_win[kp]))
+      k_mae <- mean(abs(dd$p_market[kp] - dd$home_win[kp]))
+      info("on the ", sum(kp), " games the market priced -- mean |error|: model ",
+           sprintf("%.4f", m_mae), " vs market ", sprintf("%.4f", k_mae),
+           if (k_mae < m_mae)
+             "  -- the market is the more accurate estimator, which is why ml_shrink_to_market < 1"
+           else
+             "  -- the model is more accurate here; re-check for leakage before believing it")
+      info("RMS disagreement between them: ",
+           sprintf("%.4f", sqrt(mean((dd$pred_home_win_prob[kp] - dd$p_market[kp])^2))))
+    }
   }
   invisible(tab)
 }

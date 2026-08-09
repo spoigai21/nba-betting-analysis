@@ -453,6 +453,60 @@ m_ovr <- suppressMessages(detect_columns(clean_names(tibble(
 eq(m_ovr[["spread_close"]], "weird_line_name", "a config override beats the guesser")
 
 # ===========================================================================
+section("Magnitude-plus-favourite spreads")
+# ===========================================================================
+# The most dangerous shape a betting file takes: the spread stored as a
+# positive magnitude with the favourite named in another column. Read naively
+# every away-favourite game is inverted, and a blanket sign flip cannot repair
+# it -- it lands on a plausible-looking correlation and hides the damage.
+
+eq(resolve_favourite_home(c("home","away"), c("BOS","BOS"), c("LAL","LAL")),
+   c(TRUE, FALSE), "side labels resolve")
+eq(resolve_favourite_home(c("H","V"), c("BOS","BOS"), c("LAL","LAL")),
+   c(TRUE, FALSE), "H/V abbreviations resolve")
+eq(resolve_favourite_home(c("Boston Celtics","lakers"), c("BOS","BOS"), c("LAL","LAL")),
+   c(TRUE, FALSE), "a team NAME resolves against the two sides")
+eq(resolve_favourite_home("MIA", "BOS", "LAL"), NA,
+   "a value matching neither side stays NA rather than guessing")
+
+# home favoured by 13 -> home line -13; away favoured by 5 -> home line +5
+eq(rebuild_home_spread(c(13, 5), c("home","away"), c("BOS","BOS"), c("LAL","LAL")),
+   c(-13, 5), "magnitude + favourite rebuilds a signed home line")
+eq(rebuild_home_spread(13, "home", "BOS", "LAL"), -13,
+   "the home favourite gets a negative number")
+eq(rebuild_home_spread(13, "away", "BOS", "LAL"), 13,
+   "the away favourite gets a positive number")
+eq(rebuild_home_spread(NA_real_, "home", "BOS", "LAL"), NA_real_,
+   "a missing magnitude stays missing")
+
+# The whole-column decision: rebuild only a column that never changes sign.
+g_mag <- tibble(home_team = c("BOS","LAL","MIA"), away_team = c("LAL","BOS","NYK"),
+                spread_close = c(13, 5, 2), spread_open = NA_real_,
+                .fav = c("home","away","home"))
+out <- suppressMessages(apply_favourite_orientation(g_mag))
+eq(out$spread_close, c(-13, 5, -2), "a single-signed column is rebuilt")
+
+# An already-signed column must be left alone.
+g_signed <- tibble(home_team = c("BOS","LAL"), away_team = c("LAL","BOS"),
+                   spread_close = c(-6.5, 3.5), spread_open = NA_real_,
+                   .fav = c("home","away"))
+eq(suppressMessages(apply_favourite_orientation(g_signed))$spread_close, c(-6.5, 3.5),
+   "a column that already takes both signs is untouched")
+
+# No favourite column at all -> unchanged.
+g_nofav <- g_signed; g_nofav$.fav <- NA_character_
+eq(suppressMessages(apply_favourite_orientation(g_nofav))$spread_close, c(-6.5, 3.5),
+   "no favourite column means no rebuild")
+
+# The detector must find the column, and must NOT mistake a numeric
+# "spread_favorite" (a magnitude) for a side label.
+m_fav <- suppressMessages(detect_columns(clean_names(tibble(
+  date = "x", home_team = "x", away_team = "x", home_score = 1, away_score = 1,
+  whos_favored = "home", spread = 1, total = 1)), overrides = list()))
+eq(m_fav[["favourite"]], "whos_favored", "the favourite column is detected")
+eq(m_fav[["spread_close"]], "spread", "and does not steal the spread column")
+
+# ===========================================================================
 section("Date and number parsing")
 # ===========================================================================
 
