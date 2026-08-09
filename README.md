@@ -96,7 +96,7 @@ nba-market-model/
 Rscript tests/run_tests.R
 ```
 
-207 checks over the arithmetic that would be invisible if it were wrong: odds
+224 checks over the arithmetic that would be invisible if it were wrong: odds
 conversion, settlement sign conventions, CLV signs, the no-look-ahead property
 of the rolling features, column detection against real-world header shapes,
 best-price selection across books, magnitude-plus-favourite spread rebuilding,
@@ -354,6 +354,17 @@ negation- and hedge-aware, and every extraction keeps the sentence it came from.
 `extract_player_status()` also takes an optional `gazetteer` from
 `07_usage_model.R::player_gazetteer()`, which lets it catch players ESPN did not
 tag in a given article.
+
+**Scoped absences.** The ordered rules match `"will not play"` before anything
+looks at what qualifies it, so *"will not play both ends of back-to-backs"* used
+to read as `out` at 0.95 confidence — treating a healthy star as absent, which is
+a multi-point error in the wrong direction on a game you would then bet. A claim
+scoped to a recurring situation (`both ends`, `one game of every`, plural
+`back-to-backs`) is now reclassified as `rest` and flagged `scoped`, and
+`news_absences()` holds those rows back: they say a player misses *some* game,
+not *this* one. Single events are deliberately untouched — *"the second night of
+**a** back-to-back"* is still an absence, and so is *"out for the rest of the
+season"*.
 
 Did the reads pay?
 

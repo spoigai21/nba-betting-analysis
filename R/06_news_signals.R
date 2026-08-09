@@ -295,6 +295,27 @@ NEGATION_PATTERN <- "\\bnot (out|sidelined|doubtful|questionable)\\b|\\bdenies\\
 # Phrases that make any claim speculative.
 HEDGE_PATTERN <- "\\b(could|may|might|possibl[ey]|uncertain|unclear|if he|considering|weighing)\\b"
 
+# An absence claim SCOPED to a recurring or partial situation is a workload
+# plan, not tonight's absence -- and the ordered rules cannot see the
+# difference on their own. "will not play" matches the `out` pattern at 0.95
+# before anything looks at what qualifies it, so
+#
+#     "will not play both ends of back-to-backs"
+#
+# is read as OUT at 0.95 confidence. Feed that to apply_news() and a healthy
+# star is treated as absent: a multi-point error, in the wrong direction, on a
+# game you would then bet.
+#
+# The markers below all indicate a POLICY over several games rather than one
+# missed game. Note "back-to-backs" is plural on purpose: "the second night of
+# a back-to-back" is a single event and must keep reading as an absence, while
+# "misses the second night of back-to-backs" is a standing arrangement.
+SCOPE_QUALIFIER_PATTERN <- paste0(
+  "\\b(both ends?|either end)\\b",
+  "|\\bone game of (every|each)\\b",
+  "|\\bback[- ]to[- ]backs\\b",
+  "|\\bevery (other )?(back[- ]to[- ]back|game)\\b")
+
 split_sentences <- function(text) {
   text <- text[!is.na(text)]
   if (!length(text)) return(character())
@@ -312,6 +333,7 @@ classify_sentence <- function(sentence) {
 
   negated <- grepl(NEGATION_PATTERN, s, perl = TRUE)
   hedged  <- grepl(HEDGE_PATTERN, s, perl = TRUE)
+  scoped  <- grepl(SCOPE_QUALIFIER_PATTERN, s, perl = TRUE)
   conf <- hit$weight
   if (hedged) conf <- conf * 0.6
   # A negation next to an absence claim does not flip it to "playing" -- the
@@ -319,7 +341,14 @@ classify_sentence <- function(sentence) {
   status <- hit$status
   if (negated && status %in% ABSENCE_STATUSES) { status <- "unclear"; conf <- conf * 0.3 }
 
-  list(status = status, confidence = round(conf, 2), negated = negated, hedged = hedged)
+  # A scoped absence is a rest plan, not tonight's absence. The claim is still
+  # confidently stated -- it just says something different from what the
+  # pattern matched -- so the confidence is kept and only the label changes.
+  if (scoped && status %in% ABSENCE_STATUSES && !identical(status, "rest"))
+    status <- "rest"
+
+  list(status = status, confidence = round(conf, 2),
+       negated = negated, hedged = hedged, scoped = scoped)
 }
 
 # Optional gazetteer (from 07_usage_model.R::player_gazetteer()) lets us catch
@@ -353,7 +382,7 @@ extract_player_status <- function(news, gazetteer = NULL) {
       present %>% transmute(
         .data$athlete_id, .data$player,
         status = cl$status, confidence = cl$confidence,
-        negated = cl$negated, hedged = cl$hedged,
+        negated = cl$negated, hedged = cl$hedged, scoped = cl$scoped,
         sentence = sen, headline = art$headline,
         published = art$published, url = art$url
       )
@@ -374,6 +403,19 @@ news_absences <- function(extracted, min_confidence = 0.7) {
   if (!nrow(extracted)) return(extracted)
   out <- extracted %>%
     filter(.data$status %in% ABSENCE_STATUSES, .data$confidence >= min_confidence)
+
+  # A scoped claim ("sits one game of every back-to-back") says a player will
+  # miss SOME game, not that he misses THIS one. Treating it as tonight's
+  # absence is precisely the false positive this guard exists to stop, so it is
+  # reported separately rather than folded into the absence list.
+  if ("scoped" %in% names(out)) {
+    n_scoped <- sum(out$scoped, na.rm = TRUE)
+    if (n_scoped)
+      info(n_scoped, " scoped rest-policy statement(s) held back -- they describe ",
+           "a workload plan, not tonight's availability")
+    out <- out %>% filter(!.data$scoped)
+  }
+
   info(nrow(out), " player(s) flagged as likely absent at confidence >= ", min_confidence)
   out
 }

@@ -453,6 +453,56 @@ m_ovr <- suppressMessages(detect_columns(clean_names(tibble(
 eq(m_ovr[["spread_close"]], "weird_line_name", "a config override beats the guesser")
 
 # ===========================================================================
+section("Scoped absences are rest policies, not tonight's absence")
+# ===========================================================================
+# The ordered rules match "will not play" at 0.95 before anything looks at what
+# qualifies it, so "will not play both ends of back-to-backs" read as OUT --
+# treating a healthy star as absent, a multi-point error in the wrong direction
+# on a game you would then bet. These pin the fix and, just as importantly, the
+# cases that must KEEP reading as a real absence.
+
+suppressMessages(suppressWarnings(source("R/06_news_signals.R")))
+.cls <- function(x) classify_sentence(x)$status
+.scp <- function(x) classify_sentence(x)$scoped
+
+# Scoped to a recurring situation -> a workload plan.
+eq(.cls("Wembanyama will not play both ends of back-to-backs."), "rest",
+   "'both ends of back-to-backs' is a rest policy, not an absence")
+eq(.cls("He will not play in back-to-backs the rest of the way."), "rest",
+   "plural 'back-to-backs' marks a standing arrangement")
+eq(.cls("Doncic will miss the second night of back-to-backs."), "rest",
+   "'second night of back-to-backs' is a policy")
+eq(.cls("Curry will sit one game of every back-to-back."), "rest",
+   "'one game of every' is a policy")
+ok(.scp("Curry will sit one game of every back-to-back."),
+   "and the row is flagged scoped so callers can tell")
+
+# Unscoped absences must be untouched -- this guard must not swallow real news.
+eq(.cls("Embiid will not play tonight against Boston."), "out",
+   "a plain absence still reads as out")
+eq(.cls("Morant is out for the season with a knee injury."), "out",
+   "a season-ending injury still reads as out")
+eq(.cls("Tatum will miss the next four games."), "out",
+   "a fixed number of games still reads as out")
+
+# The two cases the pattern most easily gets wrong.
+eq(.cls("Booker misses tonight, the second night of a back-to-back."), "out",
+   "a SINGULAR back-to-back is one game, and stays an absence")
+eq(.cls("Davis is out for the rest of the season."), "out",
+   "'rest of the season' is a duration, not a rest policy")
+
+# news_absences() must hold scoped rows back: they say a player misses SOME
+# game, not that he misses THIS one.
+.ext <- tibble(athlete_id = c("1", "2"), player = c("Policy Guy", "Real Out"),
+               status = c("rest", "out"), confidence = c(0.95, 0.95),
+               negated = FALSE, hedged = FALSE, scoped = c(TRUE, FALSE),
+               sentence = "s", headline = "h",
+               published = Sys.time(), url = "u")
+.abs <- suppressMessages(news_absences(.ext, min_confidence = 0.7))
+eq(nrow(.abs), 1L, "a scoped rest policy is not counted as tonight's absence")
+eq(.abs$player, "Real Out", "while a genuine absence still comes through")
+
+# ===========================================================================
 section("LLM strategy extraction -- reproducibility and the look-ahead gate")
 # ===========================================================================
 # A model call is not reproducible; a committed cache of its answers is. These
