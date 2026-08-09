@@ -334,17 +334,23 @@ project_props <- function(absent_ids, transfer, baselines, as_of = Sys.Date(),
 # rotation player was out, did baseline+bump predict teammates' lines better
 # than baseline alone? A negative answer here is the whole answer.
 
-validate_usage_model <- function(pg, split_frac = 0.7, stats = c("points", "minutes")) {
-  step("Validating the usage model out-of-sample")
+validate_usage_model <- function(pg, split_frac = 0.7, stats = c("points", "minutes"),
+                                 quiet = FALSE, replicate_by_season = TRUE) {
+  if (!quiet) step("Validating the usage model out-of-sample")
   dates <- sort(unique(pg$date))
   cut <- dates[floor(length(dates) * split_frac)]
   train <- pg %>% filter(.data$date <= cut)
   test  <- pg %>% filter(.data$date > cut)
-  info("train to ", format(cut), " (", n_distinct(train$game_id), " games); test after (",
-       n_distinct(test$game_id), " games)")
+  if (!quiet)
+    info("train to ", format(cut), " (", n_distinct(train$game_id), " games); test after (",
+         n_distinct(test$game_id), " games)")
 
-  transfer <- estimate_usage_transfer(train, stats = stats)
-  if (!nrow(transfer)) { warn("no transfer estimates -- not enough history"); return(invisible(NULL)) }
+  transfer <- if (quiet) suppressMessages(estimate_usage_transfer(train, stats = stats))
+              else estimate_usage_transfer(train, stats = stats)
+  if (!nrow(transfer)) {
+    if (!quiet) warn("no transfer estimates -- not enough history")
+    return(invisible(NULL))
+  }
 
   # open_ended: the test games all fall after training ends, so the tenure
   # window must not be capped at the last game we saw in training.
@@ -394,7 +400,7 @@ validate_usage_model <- function(pg, split_frac = 0.7, stats = c("points", "minu
     ) %>%
     filter(abs(.data$bump) > 0.01)          # only rows the model claims to move
 
-  if (!nrow(ev)) { warn("no testable rows"); return(invisible(NULL)) }
+  if (!nrow(ev)) { if (!quiet) warn("no testable rows"); return(invisible(NULL)) }
 
   # A raw RMSE difference on ~7000 rows can easily be noise. Bootstrap the
   # difference so a tiny "improvement" cannot be reported as a finding.
@@ -419,6 +425,8 @@ validate_usage_model <- function(pg, split_frac = 0.7, stats = c("points", "minu
            rmse_routed = rou$rmse, gain_routed = rou$gain,
            routed_lo = rou$lo, routed_hi = rou$hi, routed_real = rou$lo > 0)
   })
+
+  if (quiet) return(invisible(res))
 
   message("   ", sprintf("%-10s %6s  %8s  %-24s  %-24s", "stat", "n",
                          "baseline", "direct (add delta)", "routed (via minutes)"))
@@ -450,6 +458,44 @@ validate_usage_model <- function(pg, split_frac = 0.7, stats = c("points", "minu
     message("\n   This is prediction accuracy, NOT market edge. Edge needs a prop line\n",
             "   to beat, and the free data tier does not carry one.")
   }
+
+  # --- does it replicate? --------------------------------------------------
+  # A pooled result across seasons can be carried entirely by one of them. That
+  # is how a +2% gain in one season and a -1% loss in the next get reported as
+  # a win. Re-run the same test within each season and say plainly whether the
+  # pooled winners hold up; a finding that appears in one season and vanishes
+  # in the next was probably never there.
+  seasons <- sort(unique(pg$season))
+  if (replicate_by_season && length(seasons) > 1 && (length(win_d) || length(win_r))) {
+    message("")
+    step("Replication by season")
+    per <- map_dfr(seasons, function(s) {
+      r <- suppressMessages(
+        validate_usage_model(pg %>% filter(.data$season == !!s), split_frac = split_frac,
+                             stats = stats, quiet = TRUE, replicate_by_season = FALSE))
+      if (is.null(r) || !nrow(r)) return(NULL)
+      r$season <- s
+      r
+    })
+    if (!nrow(per)) {
+      warn("not enough data to re-test within seasons")
+    } else {
+      for (st in union(win_d, win_r)) {
+        rows <- per %>% filter(.data$stat == st)
+        if (!nrow(rows)) next
+        held <- sum(rows$routed_real | rows$direct_real)
+        message(sprintf("   %-10s pooled says it helps; holds in %d of %d season(s): %s",
+                        st, held, nrow(rows),
+                        paste(sprintf("%d %+.2f%%", rows$season,
+                                      100 * rows$gain_routed / rows$rmse_baseline),
+                              collapse = "  ")))
+        if (held < nrow(rows))
+          warn("  '", st, "' does not replicate in every season. Treat the pooled ",
+               "result as unproven -- it is an average over seasons that disagree.")
+      }
+    }
+  }
+
   invisible(res)
 }
 

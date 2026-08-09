@@ -395,13 +395,32 @@ games he played, shrunk toward zero for small samples, and restricted to each pl
 actual tenure window with that team (without which a February trade reads as being
 "absent" all autumn, and the estimates come out backwards).
 
-`validate_usage_model()` tests it out-of-sample with bootstrap CIs on the RMSE gain.
-On 2024–25 the honest result was: routing production through **minutes** beats a plain
-recent-form baseline for minutes and points with the interval clear of zero, and adding
-each stat's own delta directly is reliably *worse* than doing nothing for assists,
-rebounds and threes. Hence `method = "routed"` is the default. Re-run it on your own
-data before trusting it — and note this measures accuracy, not edge: the free odds tier
-carries no prop lines to beat.
+`validate_usage_model()` tests it out-of-sample with bootstrap CIs on the RMSE gain,
+then **re-tests within each season** and reports whether the pooled result replicates.
+That second step matters more than the first.
+
+The honest current result, on seasons 2025 and 2026:
+
+| stat | 2024-25 | 2025-26 |
+|---|---|---|
+| minutes | routed **+2.29%**, interval clear of zero | −1.07% |
+| points | routed **+1.09%**, interval clear of zero | +0.23%, not significant |
+| assists | −0.47% | −0.12% |
+| rebounds | +0.47% | −0.71% |
+
+**The 2024-25 finding did not replicate.** On 2025-26 alone the function's verdict is
+"Neither scheme reliably beats the plain baseline. Do not bet this." The pooled
+two-season run still reports a win on points (+0.43%), but it is carried entirely by
+the older season — which is exactly why the replication check exists.
+
+Read that as: an effect worth +2% one season and −1% the next, on ~4,500 observations
+each, was probably never there. Adding each stat's own delta directly (`method =
+"direct"`) is *reliably worse than doing nothing* in both seasons, so `"routed"`
+remains the default of the two — but the current evidence says the honest choice is to
+apply no adjustment at all until it replicates.
+
+Re-run it on your own data before trusting any of this, and note it measures accuracy,
+not edge: the free odds tier carries no prop lines to beat.
 
 ### Diagnostics: where does it fail?
 
