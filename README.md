@@ -95,10 +95,11 @@ nba-market-model/
 Rscript tests/run_tests.R
 ```
 
-146 checks over the arithmetic that would be invisible if it were wrong: odds
+164 checks over the arithmetic that would be invisible if it were wrong: odds
 conversion, settlement sign conventions, CLV signs, the no-look-ahead property
-of the rolling features, column detection against real-world header shapes, and
-the append-only guarantees of the track record. They run in about a second and
+of the rolling features, column detection against real-world header shapes,
+best-price selection across books, and the append-only guarantees of the track
+record. They run in about a second and
 need no data. Run them before trusting a number.
 
 ---
