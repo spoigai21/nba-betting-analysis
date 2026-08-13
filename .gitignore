@@ -25,3 +25,7 @@ output/diagnostics_segments.csv
 # the record auditable — a timestamped prediction you can't show is worthless.
 
 .DS_Store
+
+# Working notes from build sessions -- handoff context, not part of the repo's
+# public story. README.md and RUNBOOK.md carry what a reader actually needs.
+SESSION_CONTEXT.md

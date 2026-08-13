@@ -326,9 +326,22 @@ build_upcoming <- function(lines, state) {
     warn(past, " of these games are dated in the past. Forward-testing means ",
          "predicting games that have not happened; check the odds feed.")
 
-  lines %>%
+  up <- lines %>%
     inner_join(side("h_"), by = c("home_team" = "h_team")) %>%
-    inner_join(side("a_"), by = c("away_team" = "a_team")) %>%
+    inner_join(side("a_"), by = c("away_team" = "a_team"))
+
+  # The same floor 02_features.R applies to the backtest. Without it, early in
+  # a season the live path bets games the backtest would have thrown away.
+  thin <- up$h_gp_prior < CFG$model$min_prior_games |
+          up$a_gp_prior < CFG$model$min_prior_games
+  if (any(thin, na.rm = TRUE)) {
+    info("skipping ", sum(thin, na.rm = TRUE), " game(s) where a team has fewer ",
+         "than ", CFG$model$min_prior_games, " games -- the backtest excludes ",
+         "these, so betting them would not be testing the same strategy")
+    up <- up[!thin, ]
+  }
+
+  up %>%
     mutate(
       # Clamped to [0, 7]: same ceiling 02_features.R uses, and a floor so a
       # stale or mis-dated feed cannot produce a negative rest day.
@@ -338,6 +351,126 @@ build_upcoming <- function(lines, state) {
       a_b2b = as.integer(.data$a_rest_days <= 1)
     ) %>%
     derive_matchup_features()
+}
+
+# ===========================================================================
+# 2b. Readiness -- the guard that stops a season boundary logging nonsense
+# ===========================================================================
+# latest_team_state() takes the newest season in games.rds and calls it "now".
+# Run on opening night, before any new results have been loaded, that silently
+# returns LAST season's form -- 88 games per team, a last_game five months old,
+# ratings fitted on rosters that have since changed -- and logs bets against it.
+# The only complaint is a staleness warning, which is easy to scroll past.
+#
+# The second trap is subtler. 02_features.R drops any game where either team has
+# played fewer than min_prior_games, on the grounds that its form numbers mean
+# nothing yet. The live path had no such rule, so for the first three weeks of a
+# season it would log bets the backtest would have refused to evaluate -- a
+# forward test of a strategy the backtest never measured.
+#
+# Both are refusals rather than warnings, because both fail quietly.
+
+# Fold this season's completed games into games.rds.
+#
+# Without this the forward test can never start. games.rds is built from the
+# Kaggle file, which will not carry the current season until whoever maintains
+# it gets round to it -- so team form would sit frozen on last season and
+# forward_preflight() would refuse forever, correctly.
+#
+# hoopR has results the morning after a game, which is all team form needs: it
+# reads scores only. Those rows carry no betting lines, so they feed the model
+# but cannot themselves be backtested. A later Kaggle refresh fills the lines
+# in. Existing rows are never overwritten -- a game already carrying a line
+# keeps it.
+refresh_results <- function(season = season_of(Sys.Date()),
+                            path = CFG$paths$games_rds) {
+  if (!requireNamespace("hoopR", quietly = TRUE)) {
+    warn('install.packages("hoopR") to refresh results'); return(invisible(NULL))
+  }
+  step("Refreshing results for season ", season)
+
+  sched <- try(hoopR::load_nba_schedule(seasons = season), silent = TRUE)
+  if (inherits(sched, "try-error") || !NROW(sched)) {
+    warn("hoopR returned nothing for season ", season); return(invisible(NULL))
+  }
+  hcol <- intersect(c("home_display_name", "home_name", "home_location"), names(sched))[1]
+  acol <- intersect(c("away_display_name", "away_name", "away_location"), names(sched))[1]
+  if (is.na(hcol) || is.na(acol)) {
+    warn("unrecognised hoopR schedule columns"); return(invisible(NULL))
+  }
+
+  fresh <- sched %>%
+    filter(!is.na(.data$home_score), !is.na(.data$away_score)) %>%
+    transmute(date = as.Date(.data$game_date),
+              home_team = canonical_team(.data[[hcol]]),
+              away_team = canonical_team(.data[[acol]]),
+              home_score = as.numeric(.data$home_score),
+              away_score = as.numeric(.data$away_score)) %>%
+    # All-Star and Rising Stars rosters map to nothing real and would wreck
+    # every pace and defence number they touched.
+    filter(.data$home_team %in% TEAM_ALIASES$code,
+           .data$away_team %in% TEAM_ALIASES$code) %>%
+    mutate(season = as.integer(season),
+           total_points = .data$home_score + .data$away_score,
+           margin = .data$home_score - .data$away_score,
+           home_win = as.integer(.data$margin > 0),
+           completed = TRUE,
+           game_id = paste0(format(.data$date, "%Y%m%d"), "_",
+                            .data$away_team, "_at_", .data$home_team))
+
+  old <- readRDS(path)
+  add <- fresh %>% filter(!.data$game_id %in% old$game_id)
+  if (!nrow(add)) { info("no new completed games"); return(invisible(old)) }
+
+  out <- bind_rows(old, add) %>% arrange(.data$date, .data$game_id)
+  saveRDS(out, path)
+  info("added ", nrow(add), " completed game(s); ", nrow(out), " total, through ",
+       format(max(out$date)))
+  info("these rows carry no betting lines -- they inform form, not the backtest")
+  invisible(out)
+}
+
+forward_preflight <- function(tg, as_of = Sys.Date(), games = NULL,
+                              max_stale_days = 5) {
+  issues <- character()
+
+  have <- max(tg$season, na.rm = TRUE)
+  want <- season_of(as_of)
+  if (is.na(have) || have != want)
+    issues <- c(issues, paste0(
+      "results file holds season ", have, " but ", format(as_of), " is season ",
+      want, ". Refresh data/processed/games.rds with this season's completed ",
+      "games -- otherwise last season's form is used as though it were current."))
+
+  cur <- tg %>% filter(.data$season == !!want, .data$date < as_of)
+  if (!nrow(cur)) {
+    issues <- c(issues, paste0("no completed games in season ", want, " yet."))
+  } else {
+    stale <- as.numeric(as_of - max(cur$date))
+    if (stale > max_stale_days)
+      issues <- c(issues, paste0("most recent result is ", round(stale),
+                                 " days old (limit ", max_stale_days, ")."))
+    gp <- cur %>% count(.data$team)
+    thin <- sum(gp$n < CFG$model$min_prior_games)
+    if (thin)
+      issues <- c(issues, paste0(
+        thin, " team(s) have fewer than ", CFG$model$min_prior_games,
+        " games. The backtest excludes those games, so betting them now would ",
+        "forward-test something it never measured. Wait for them to catch up ",
+        "-- individual games are dropped automatically in the meantime."))
+  }
+
+  if (!nzchar(Sys.getenv(CFG$odds_api$key_env, "")))
+    issues <- c(issues, paste0("no ", CFG$odds_api$key_env, " in .env."))
+
+  list(ok = !length(issues), issues = issues)
+}
+
+report_preflight <- function(pf) {
+  step("Pre-flight")
+  if (pf$ok) { info("ready to log"); return(invisible(TRUE)) }
+  for (i in pf$issues) warn(i)
+  invisible(FALSE)
 }
 
 # ===========================================================================
@@ -571,8 +704,20 @@ to_track_rows <- function(p, ts = Sys.time()) {
 # ===========================================================================
 
 log_predictions <- function(dry_run = FALSE,
-                            use_news = CFG$news$apply_in_forward) {
+                            use_news = CFG$news$apply_in_forward,
+                            force = FALSE) {
   step("Forward test: logging predictions")
+
+  # Refuse rather than warn. Both conditions this catches fail silently, and a
+  # track record is only worth keeping if every row in it was logged under
+  # conditions the backtest actually measured.
+  pf <- forward_preflight(team_games)
+  report_preflight(pf)
+  if (!pf$ok && !dry_run && !force)
+    stop("Pre-flight failed -- nothing logged. Fix the above, or pass ",
+         "force = TRUE if you have read every item and still mean it.",
+         call. = FALSE)
+  if (!pf$ok && force) warn("pre-flight overridden with force = TRUE")
 
   lines <- consensus_lines(tidy_odds(fetch_odds_raw()))
   if (!nrow(lines)) { warn("no upcoming games returned by the odds API"); return(invisible(NULL)) }

@@ -62,7 +62,9 @@ shows any real edge.
 nba-market-model/
 ├── README.md
 ├── instructions.md         # step-by-step beginner setup + build guide
-├── run_all.R               # runs the whole backtest pipeline (01 → 04)
+├── run_all.R               # runs the whole backtest pipeline (01 → 04, 08)
+├── daily.R                 # the in-season loop: morning | log | close
+├── RUNBOOK.md              # when to start, what to run, what refusals mean
 ├── data/                   # raw data (Kaggle CSVs) — gitignored if large
 │   ├── nba_betting.csv
 │   └── processed/          # tidy tables written by 01/02
@@ -96,7 +98,7 @@ nba-market-model/
 Rscript tests/run_tests.R
 ```
 
-224 checks over the arithmetic that would be invisible if it were wrong: odds
+233 checks over the arithmetic that would be invisible if it were wrong: odds
 conversion, settlement sign conventions, CLV signs, the no-look-ahead property
 of the rolling features, column detection against real-world header shapes,
 best-price selection across books, magnitude-plus-favourite spread rebuilding,
@@ -301,6 +303,23 @@ ODDS_API_KEY=your_key_here
 
 `log_predictions()` only ever appends, never rewrites a logged prediction, and
 `update_results()` only fills blank cells. That is what makes the record auditable.
+
+**In season, use `daily.R`** — see [RUNBOOK.md](RUNBOOK.md):
+
+```sh
+Rscript daily.R morning    # results in, grade yesterday, report
+Rscript daily.R log        # predictions, hours before tip-off
+Rscript daily.R close      # closing lines, ~15 min before tip-off
+```
+
+**Do not start on opening night.** `latest_team_state()` takes the newest season
+in `games.rds` and calls it "now" — run against a stale file it silently uses
+*last* season's form, 88 games per team, rosters since changed. And until teams
+have 10 games, `02_features.R` would have excluded them from the backtest, so
+betting them live forward-tests something never measured. Both fail quietly, so
+`forward_preflight()` **refuses** rather than warning. In practice that means
+mid-November, not late October; run the morning step from opening night anyway,
+since that is what accumulates the results the gate waits on.
 
 **Fair value and execution price are separate things.** The median across books
 is the best estimate of what a game is worth, and it is what a bet is *selected*

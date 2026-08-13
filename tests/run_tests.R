@@ -453,6 +453,54 @@ m_ovr <- suppressMessages(detect_columns(clean_names(tibble(
 eq(m_ovr[["spread_close"]], "weird_line_name", "a config override beats the guesser")
 
 # ===========================================================================
+section("Forward-test pre-flight")
+# ===========================================================================
+# Both conditions here fail SILENTLY in the live path: a stale results file
+# makes last season's form look current, and a thin early season logs bets the
+# backtest would have refused to evaluate. Warnings get scrolled past, so these
+# are refusals -- and a refusal is only trustworthy if it is also precise.
+
+suppressMessages(suppressWarnings(source("R/05_forward.R")))
+
+.tg <- function(season, n_per_team, last_date) {
+  teams <- head(TEAM_ALIASES$code, 30)
+  expand.grid(team = teams, i = seq_len(n_per_team), stringsAsFactors = FALSE) |>
+    as_tibble() |>
+    mutate(season = season, date = as.Date(last_date) - .data$i)
+}
+
+.saved_key <- Sys.getenv("ODDS_API_KEY")
+Sys.setenv(ODDS_API_KEY = "test-key")
+
+# Healthy: current season, fresh, everyone past the floor.
+.ok <- forward_preflight(.tg(2027L, 20L, "2026-12-01"), as_of = as.Date("2026-12-01"))
+ok(.ok$ok, "a current, fresh, experienced season passes")
+
+# Stale file: newest season is last season. This is the opening-night trap.
+.stale <- forward_preflight(.tg(2026L, 80L, "2026-06-13"), as_of = as.Date("2026-10-21"))
+ok(!.stale$ok, "a results file a season behind is refused")
+ok(any(grepl("season 2026 but", .stale$issues)),
+   "and says which season it has versus which it needs")
+
+# Thin season: right season, current, but teams are 5 games in.
+.thin <- forward_preflight(.tg(2027L, 5L, "2026-11-01"), as_of = as.Date("2026-11-01"))
+ok(!.thin$ok, "a season where teams are below the games floor is refused")
+ok(any(grepl("fewer than", .thin$issues)),
+   "and explains that the backtest excludes those games")
+
+# Stale-by-days: right season, enough games, but nothing recent.
+.old <- forward_preflight(.tg(2027L, 20L, "2026-11-01"), as_of = as.Date("2026-12-01"))
+ok(!.old$ok, "results that stopped updating are refused")
+ok(any(grepl("days old", .old$issues)), "and report how far behind they are")
+
+# The key check is independent of the data checks.
+Sys.setenv(ODDS_API_KEY = "")
+.nokey <- forward_preflight(.tg(2027L, 20L, "2026-12-01"), as_of = as.Date("2026-12-01"))
+ok(!.nokey$ok, "a missing odds key is refused")
+ok(any(grepl("ODDS_API_KEY", .nokey$issues)), "and named explicitly")
+if (nzchar(.saved_key)) Sys.setenv(ODDS_API_KEY = .saved_key) else Sys.unsetenv("ODDS_API_KEY")
+
+# ===========================================================================
 section("Scoped absences are rest policies, not tonight's absence")
 # ===========================================================================
 # The ordered rules match "will not play" at 0.95 before anything looks at what
